@@ -140,7 +140,7 @@ def main():
         check_model(model, device, test_loader)
         scheduler.step()
         print(model.weight_dist_by_chunk())
-        print(model.bias_dist_by_chunk())
+        #print(model.bias_dist_by_chunk())
 
     if args.save_model:
         torch.save(model.state_dict(), args.save_model + ".pt")

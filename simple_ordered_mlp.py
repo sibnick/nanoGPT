@@ -21,9 +21,15 @@ class MNSIT_OrderedNet(nn.Module):
         chunk = torch.ones((1, int(num_features/chunk_num)))
         chunks = []
         decay = initial_decay
-        for n in range(self.chunk_num):
+        for n in range(int(self.chunk_num)):
             chunks.append(chunk * decay)
             decay *= decay_factor
+        #
+        # decay /= decay_factor
+        # for n in range(int(self.chunk_num / 2)):
+        #     chunks.append(chunk * decay)
+        #     decay /= decay_factor
+
         self.decay = nn.Parameter(torch.concat(chunks, dim=1))
         self.decay.requires_grad = False
         chunks.reverse()
@@ -44,8 +50,9 @@ class MNSIT_OrderedNet(nn.Module):
         # t = torch.arange(127, 0, step=-1, requires_grad=False).cuda()
         # return (tmp * t).abs().mean()
 
-    def apply_features(self, features: int, fixed_threshold: float = 2.0, dynamic_threshold: float = 0.1):
+    def apply_features(self, features: int, start: int = 0, fixed_threshold: float = 2.0, dynamic_threshold: float = 0.1):
         self.trimed = True
+        self.start_idx = start
         self.features = features
         self.fixed_threshold = fixed_threshold
         self.dynamic_threshold = dynamic_threshold
@@ -55,8 +62,8 @@ class MNSIT_OrderedNet(nn.Module):
         weight = fc.weight
         bias = fc.bias
         fc = nn.Linear(weight.shape[1], features)
-        fc.weight = nn.Parameter(weight[0:features, :])
-        fc.bias = nn.Parameter(bias[0:features])
+        fc.weight = nn.Parameter(weight[self.start_idx : self.start_idx + features, :])
+        fc.bias = nn.Parameter(bias[self.start_idx : self.start_idx + features])
         fc.to(weight.device)
         return fc
 
@@ -86,8 +93,11 @@ class MNSIT_OrderedNet(nn.Module):
         if self.trimed:
             x1 = self.trimed_fc1(x)
             x1 = F.relu(x1)
-            x1 = torch.concat([x1, self.fc1.bias.data[self.features:].view(1, -1).repeat(x1.shape[0], 1)], dim=1)
-            #x = torch.concat([x, torch.zeros((x.shape[0], 128 - self.features), device=x.device)], dim=1)
+            x1 = torch.concat(
+                [self.fc1.bias.data[:self.start_idx].view(1, -1).repeat(x1.shape[0], 1),
+                 x1,
+                 self.fc1.bias.data[self.start_idx + self.features:].view(1, -1).repeat(x1.shape[0], 1)], dim=1)
+            # x1 = torch.concat([x1, torch.zeros((x.shape[0], 128 - self.features), device=x1.device)], dim=1)
             x1 = self.dropout2(x1)
             x1 = self.fc2(x1)
         else:

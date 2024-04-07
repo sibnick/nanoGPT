@@ -78,7 +78,7 @@ def main():
     model.load_state_dict(torch.load(args.load_model + ".pt"))
     if args.features < 128:
         print("Trim features more than ", args.features)
-        model.apply_features(args.features, fixed_threshold=2)
+        model.apply_features(args.features, fixed_threshold=2, dynamic_threshold=0.07, start=14)
     check_model(model, device, test_loader)
 
 
