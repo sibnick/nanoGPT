@@ -18,13 +18,15 @@ def train(args, model, device, train_loader, optimizer, epoch, use_ordering, n):
         output = model(data)
         loss = F.nll_loss(output, target)
         loss0 = loss.detach().item()
-        if use_ordering:
-            l1 = model.calc_decay()
-            #make l1 loss proportional to main loss
-            coef = l1.detach()/loss0
-            loss += l1/coef/math.sqrt(n)
+        # if use_ordering:
+        #     l1 = model.calc_decay()
+        #     #make l1 loss proportional to main loss
+        #     coef = l1.detach()/loss0
+        #     loss += l1/coef/math.sqrt(n)
         loss.backward()
         optimizer.step()
+        with torch.no_grad():
+            model.apply_decay()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tLoss0: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
@@ -77,8 +79,8 @@ def main():
                         help='random seed (default: 1)')
     parser.add_argument('--num-features', type=int, default=128,
                         help='Number of features (default: 128)')
-    parser.add_argument('--chunks', type=int, default=8,
-                        help='Number of chunks (default: 8)')
+    parser.add_argument('--chunks', type=int, default=16,
+                        help='Number of chunks (default: 16)')
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', default=None,

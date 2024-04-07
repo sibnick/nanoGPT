@@ -20,9 +20,9 @@ def check_model(model, device, test_loader):
 
     test_loss /= len(test_loader.dataset)
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%); Rework: {}\n'.format(
         test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+        100. * correct / len(test_loader.dataset), model.rework_count))
 
 
 def main():
@@ -78,7 +78,7 @@ def main():
     model.load_state_dict(torch.load(args.load_model + ".pt"))
     if args.features < 128:
         print("Trim features more than ", args.features)
-        model.apply_features(args.features)
+        model.apply_features(args.features, fixed_threshold=2)
     check_model(model, device, test_loader)
 
 

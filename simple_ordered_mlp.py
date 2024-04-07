@@ -15,12 +15,6 @@ class MNSIT_OrderedNet(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
-        # if use_ordering:
-        #     self.dropout2_0 = nn.Dropout(0)
-        #     self.dropout2 = nn.Dropout(0.5)
-        # else:
-        #     self.dropout2 = nn.Dropout(0.5)
-
         self.fc1 = nn.Linear(9216, num_features)
         self.fc2 = nn.Linear(num_features, 10)
         assert self.num_features % chunk_num == 0
@@ -28,10 +22,6 @@ class MNSIT_OrderedNet(nn.Module):
         chunks = []
         decay = initial_decay
         for n in range(self.chunk_num):
-            # if n != 0:
-            #     chunks.append(chunk * 1e-5)
-            # else:
-            #     chunks.append(chunk * 1e-6)
             chunks.append(chunk * decay)
             decay *= decay_factor
         self.decay = nn.Parameter(torch.concat(chunks, dim=1))
@@ -39,16 +29,26 @@ class MNSIT_OrderedNet(nn.Module):
         chunks.reverse()
         self.decay_reverse = nn.Parameter(torch.concat(chunks, dim=1))
         self.decay_reverse.requires_grad = False
-        print(self.decay.shape, self.calc_decay())
+
+        #self.fc1.weight.data.mul_(initial_decay / self.decay.T)
+        print(self.fc2.weight.shape)
+        self.rework_count = 0
 
 
+    def apply_decay(self):
+        self.fc2.weight *= (1-self.decay)
     def calc_decay(self):
-        #import math
-        return (self.fc2.weight * self.decay).abs_().sum() #+ (self.fc1.bias * self.decay_reverse).abs_().sum()
+        return (self.fc2.weight * self.decay).abs_().sum()
+        # tmp = (self.fc2.weight[:, 1:] / (1e-9 + self.fc2.weight[:, :-1]))
+        # tmp = tmp * tmp
+        # t = torch.arange(127, 0, step=-1, requires_grad=False).cuda()
+        # return (tmp * t).abs().mean()
 
-    def apply_features(self, features: int):
+    def apply_features(self, features: int, fixed_threshold: float = 2.0, dynamic_threshold: float = 0.1):
         self.trimed = True
         self.features = features
+        self.fixed_threshold = fixed_threshold
+        self.dynamic_threshold = dynamic_threshold
         self.trimed_fc1 = self.trim_layer(self.fc1, features)
 
     def trim_layer(self, fc: nn.Linear, features: int) -> nn.Linear:
@@ -84,26 +84,33 @@ class MNSIT_OrderedNet(nn.Module):
         x = self.dropout1(x)
         x = torch.flatten(x, 1)
         if self.trimed:
-            x = self.trimed_fc1(x)
-            x = F.relu(x)
-            x = torch.concat([x, self.fc1.bias.data[self.features:].view(1, -1).repeat(x.shape[0], 1)], dim=1)
+            x1 = self.trimed_fc1(x)
+            x1 = F.relu(x1)
+            x1 = torch.concat([x1, self.fc1.bias.data[self.features:].view(1, -1).repeat(x1.shape[0], 1)], dim=1)
             #x = torch.concat([x, torch.zeros((x.shape[0], 128 - self.features), device=x.device)], dim=1)
-            x = self.dropout2(x)
-            x = self.fc2(x)
+            x1 = self.dropout2(x1)
+            x1 = self.fc2(x1)
         else:
-            x = self.fc1(x)
-            x = F.relu(x)
-            # if self.use_ordering:
-            #     # chunks = [self.dropout2_0(x[:, 0:self.chunk_step]), self.dropout2(x[:, self.chunk_step:])]
-            #     chunks = []
-            #     start = 0
-            #     for n in range(self.chunk_num):
-            #         chunks.append(self.dropout2(x[:, start:(start + self.chunk_step)]))
-            #         start += self.chunk_step
-            #     x = torch.concat(chunks, dim=1)
-            # else:
-            #     x = self.dropout2(x)
-            x = self.dropout2(x)
-            x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
+            x1 = self.fc1(x)
+            x1 = F.relu(x1)
+            x1 = self.dropout2(x1)
+            x1 = self.fc2(x1)
+        output = F.log_softmax(x1, dim=1)
+
+        if self.trimed and self.fixed_threshold > 0:
+            top2_output, _ = output.topk(2, dim=1)
+            top2_output, _ = torch.sort(top2_output, dim=1)
+            rate = top2_output[:, 0] / top2_output[:, 1]
+            need_rework = rate < self.fixed_threshold
+            rework_percent = 1.0 * need_rework.sum() / output.shape[0]
+            if self.dynamic_threshold < rework_percent:
+                _, need_rework = rate.topk(int(output.shape[0]*self.dynamic_threshold), largest=False)
+            x2 = x[need_rework]
+            x2 = self.fc1(x2)
+            x2 = F.relu(x2)
+            x2 = self.dropout2(x2)
+            x2 = self.fc2(x2)
+            output2 = F.log_softmax(x2, dim=1)
+            output[need_rework] = output2
+            self.rework_count += output2.shape[0]
         return output
