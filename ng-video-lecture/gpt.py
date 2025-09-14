@@ -3,17 +3,28 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 2048 # how many independent sequences will we process in parallel?
+batch_size = 1024 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
 max_iters = 100
 eval_interval = 10
-learning_rate = 3e-4
+learning_rate = 1e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 10
 n_embd = 384
-n_head = 1
-n_layer = 1
+n_head = 2
+n_layer = 2
 dropout = 0.2
+# ------------
+
+
+from glove import GloVeModel  # import your model class
+# 1) instantiate model with same constructor args used during training
+gmodel = GloVeModel(n_embd, 1, 65)
+state = torch.load("/data/nikolay/flibusta-prj/static-emb/data_tinyshakespeare/glove_test-384-1.pt")
+gmodel.load_state_dict(state)
+gmodel = gmodel.to(device=device)
+emb_matrix = gmodel._context_embeddings.weight + gmodel._focal_embeddings.weight
+emb_matrix.detach_()
 # ------------
 
 torch.manual_seed(1337)
@@ -144,7 +155,7 @@ class GPTLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
-        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.lm_head = nn.Linear(n_embd, n_embd)
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
@@ -166,15 +177,23 @@ class GPTLanguageModel(nn.Module):
         x = tok_emb + pos_emb # (B,T,C)
         x = self.blocks(x) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+        x = self.lm_head(x) # (B,T,vocab_size)
+        # (1, 1, vocab_size, C) - (B, T, vocab_size)
+        logits = x @ emb_matrix.T
 
         if targets is None:
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            #logits = logits.view(B*T, C)
+            #targets = targets.view(B*T)
+            #loss = F.cross_entropy(logits, targets)
+            # gather target embeddings
+            target_embs = emb_matrix[targets]  # (B, T, D)
+            # cosine similarity per token
+            cos_sim = F.cosine_similarity(x, target_embs, dim=-1)  # (B, T)
+            # basic loss: 1 - cos
+            loss = (1.0 - cos_sim).mean()
 
         return logits, loss
 
