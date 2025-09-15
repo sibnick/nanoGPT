@@ -3,16 +3,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 1024 # how many independent sequences will we process in parallel?
+batch_size = 512 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 100
+max_iters = 1000
 eval_interval = 10
-learning_rate = 1e-4
+learning_rate = 5e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 10
 n_embd = 384
-n_head = 2
-n_layer = 2
+n_head = 4
+n_layer = 4
 dropout = 0.2
 # ------------
 
@@ -20,7 +20,7 @@ dropout = 0.2
 from glove import GloVeModel  # import your model class
 # 1) instantiate model with same constructor args used during training
 gmodel = GloVeModel(n_embd, 1, 65)
-state = torch.load("/data/nikolay/flibusta-prj/static-emb/data_tinyshakespeare/glove_test-384-1.pt")
+state = torch.load("/data/nikolay/flibusta-prj/static-emb/data_tinyshakespeare/glove_test-384-16.pt")
 gmodel.load_state_dict(state)
 gmodel = gmodel.to(device=device)
 emb_matrix = gmodel._context_embeddings.weight + gmodel._focal_embeddings.weight
@@ -117,13 +117,13 @@ class MultiHeadAttention(nn.Module):
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
 
-    def __init__(self, n_embd):
+    def __init__(self, n_embd, ff_dropout=dropout):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
+            nn.Dropout(ff_dropout),
         )
 
     def forward(self, x):
@@ -155,7 +155,10 @@ class GPTLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
-        self.lm_head = nn.Linear(n_embd, n_embd)
+        #self.lm_head = nn.Linear(n_embd, vocab_size)
+        #MY
+        self.lm_head = FeedFoward(n_embd, ff_dropout=0) #nn.Linear(n_embd, n_embd)
+        # self.lm_head = nn.Linear(n_embd, n_embd)
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
@@ -177,23 +180,34 @@ class GPTLanguageModel(nn.Module):
         x = tok_emb + pos_emb # (B,T,C)
         x = self.blocks(x) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
-        x = self.lm_head(x) # (B,T,vocab_size)
         # (1, 1, vocab_size, C) - (B, T, vocab_size)
+
+        # logits = self.lm_head(x)
+        #MY:
+        # x = 0.5 * (x + emb_matrix[idx])
+        # x = x * emb_matrix[idx]
+        x = self.lm_head(x) # (B,T,vocab_size)
         logits = x @ emb_matrix.T
 
         if targets is None:
             loss = None
         else:
             B, T, C = logits.shape
-            #logits = logits.view(B*T, C)
-            #targets = targets.view(B*T)
-            #loss = F.cross_entropy(logits, targets)
+            # logits = logits.view(B*T, C)
+            # targets = targets.view(B*T)
+            # loss = F.cross_entropy(logits, targets)
+
+            #MY:
             # gather target embeddings
             target_embs = emb_matrix[targets]  # (B, T, D)
             # cosine similarity per token
-            cos_sim = F.cosine_similarity(x, target_embs, dim=-1)  # (B, T)
+            sim = F.cosine_similarity(x, target_embs, dim=-1)  # (B, T)
             # basic loss: 1 - cos
-            loss = (1.0 - cos_sim).mean()
+            loss = (1.0 - sim).mean()
+
+            #sim = F.pairwise_distance(x, target_embs, p=2)/n_embd  # (B, T)
+            #loss = sim.mean()
+
 
         return logits, loss
 
@@ -241,4 +255,13 @@ for iter in range(max_iters):
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+checkpoint = {
+    'model': model.state_dict(),
+}
+
+print(f"saving checkpoint")
+import os
+torch.save(checkpoint, os.path.join(".", 'ckpt.pt'))
+
 #open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
