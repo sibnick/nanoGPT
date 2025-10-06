@@ -6,13 +6,14 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from vector_model import GPTConfig, VectorGPT
+from vector_model2 import GPTConfig, VectorGPT
+from vector_model2 import VectorGPT
 
 # -----------------------------------------------------------------------------
-# init_from = 'gpt2' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "The God  "# or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+# init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
+out_dir = 'out_v2' # ignored if init_from is not 'resume'
+start = "The God"# or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 1 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
@@ -37,25 +38,17 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    gptconf = GPTConfig.get_config_by_name("gpt2") #**checkpoint['model_args'])
     model = VectorGPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.add_vector_head()
     model.load_state_dict(state_dict)
     state_dict = checkpoint['model']
-    head2 = dict()
-    for k, v in list(state_dict.items()):
-        if k.startswith("lm_head2"):
-            head2[k[9:]] = v
-    model.lm_head2.load_state_dict(head2)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = VectorGPT.from_pretrained(init_from, dict(dropout=0.0))
-    model.add_vector_head()
+else:
+    model = VectorGPT(GPTConfig.get_config_by_name(init_from))
 
 model.eval()
 model.to(device)
