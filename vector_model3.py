@@ -10,26 +10,39 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
-import hnswlib
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class MLP2(nn.Module):
 
-    def __init__(self, n_embd=768, bias=False, dropout=0.0):
+class Emb2VectMLP(nn.Module):
+
+    def __init__(self, vocab_size=50304, n_embd=768, bias=False, k=1):
         super().__init__()
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
         self.c_fc    = nn.Linear(n_embd, n_embd, bias=bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(n_embd, 768, bias=bias)
+        self.c_proj  = nn.Linear(n_embd, n_embd*k, bias=bias)
+        self.v_emb = nn.Embedding(vocab_size, n_embd*k)
+        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.02)
         torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.001)
 
-    def forward(self, x):
+    def forward(self, x, targets):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
-        return x
+        dist = torch.cdist(x, self.v_emb.weight, p=2)
+        loss = torch.cdist(dist, targets, p=2)
+        #x = x @ self.v_emb.weight.T
+        #loss = torch.mean(torch.norm(x - targets, p=2, dim=1))
+        # loss = F.cosine_embedding_loss(input1=targets, input2=x, target=torch.ones(x.shape[0], device=x.device))
+        # loss2 = torch.mean(torch.abs(torch.eye(self.n_embd, device=x.device) - self.v_emb.weight.T @ self.v_emb.weight))
+        # loss2 = torch.mean(torch.abs(1 - torch.norm(self.v_emb.weight, p=2, dim=1)))
+        return torch.mean(loss)# + loss2, loss2
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -131,53 +144,27 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-class V2ECache:
-    def __init__(self, embeddings, vector_model):
-        self.embeddings = embeddings
-        self.vector_model = vector_model.eval()
-        with torch.no_grad():
-            vectors = vector_model(embeddings)
-        num_elements, dim = vectors.shape
+class GPT(nn.Module):
 
-        p = hnswlib.Index(space='cosine', dim=dim)
-        p.init_index(max_elements=num_elements, ef_construction=100, M=64)
-        p.set_ef(50)
-        p.set_num_threads(4)
-        data = vectors.cpu().numpy()
-        p.add_items(data)
-        self.vector_db = p
-
-    def token_to_embedding(self, token):
-        return self.embeddings[token]
-
-    def embedding_to_token(self, embedding):
-        vector = self.vector_model(embedding)
-        vector = vector.to(dtype=torch.float32)
-        label, dist = self.vector_db.knn_query(vector.view((-1, 768)).cpu().numpy(), k=1)
-        return torch.tensor(label, dtype=torch.int64, device="cuda")
-
-
-class VectorGPT(nn.Module):
-
-    def __init__(self, config, cache: V2ECache):
+    def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.cache = cache
+
         self.transformer = nn.ModuleDict(dict(
-            #wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        #self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -216,7 +203,7 @@ class VectorGPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.cache.token_to_embedding(idx.cpu().numpy()).to(device) # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
@@ -229,10 +216,10 @@ class VectorGPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.cache.embedding_to_token(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, x
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -271,18 +258,7 @@ class VectorGPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-
-        model_hf = GPT2LMHeadModel.from_pretrained("gpt2")
-        sd_hf = model_hf.state_dict()
-        head_weight = sd_hf["lm_head.weight"]
-        head_weight = torch.cat((head_weight, torch.zeros((50304 - 50257, 768))), 0)
-        head_weight.requires_grad_(False)
-
-        state_dict = torch.load("out_head/768.pt", weights_only=True)
-        vmodel = MLP2()
-        vmodel.load_state_dict(state_dict, strict=False)
-        cache = V2ECache(head_weight.to(device="cuda"), vmodel.to(device="cuda"))
-        model = VectorGPT(config, cache)
+        model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
@@ -298,14 +274,14 @@ class VectorGPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) - 2 == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
-            elif k in sd:
+            else:
                 # vanilla copy over the other parameters
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
@@ -366,17 +342,17 @@ class VectorGPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            idx_next, _ = self(idx_cond)
-            # # pluck the logits at the final step and scale by desired temperature
-            # logits = logits[:, -1, :] / temperature
-            # # optionally crop the logits to only the top k options
-            # if top_k is not None:
-            #     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            #     logits[logits < v[:, [-1]]] = -float('Inf')
-            # # apply softmax to convert logits to (normalized) probabilities
-            # probs = F.softmax(logits, dim=-1)
-            # # sample from the distribution
-            # idx_next = torch.multinomial(probs, num_samples=1)
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 

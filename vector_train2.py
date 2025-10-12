@@ -32,7 +32,7 @@ from vector_model2 import GPTConfig, VectorGPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out_v2'
+out_dir = 'out_v2_tmp'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -78,7 +78,7 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 
 #MY !!!!
 learning_rate = 5e-3 # max learning rate
-max_iters = 1000 # total number of training iterations
+max_iters = 100 # total number of training iterations
 eval_interval = 10
 min_lr = 5e-5
 warmup_iters = 10 # how many steps to warm up for

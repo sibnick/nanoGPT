@@ -6,7 +6,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from vector_model2 import GPTConfig, VectorGPT
+from vector_model3 import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 init_from = 'gpt2' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -37,7 +37,7 @@ if init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
-    model = VectorGPT(gptconf)
+    model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
@@ -46,7 +46,7 @@ if init_from == 'resume':
     model.load_state_dict(state_dict)
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
-    model = VectorGPT.from_pretrained(init_from, dict(dropout=0.0))
+    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
 model.eval()
 model.to(device)
@@ -84,6 +84,6 @@ x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens) #, temperature=temperature, top_k=top_k)
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
