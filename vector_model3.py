@@ -9,8 +9,10 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import os
 from dataclasses import dataclass
 
+import hnswlib
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -22,26 +24,54 @@ class Emb2VectMLP(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embd = n_embd
-        self.c_fc    = nn.Linear(n_embd, n_embd, bias=bias)
+        self.c_fc    = nn.Linear(n_embd, 2*n_embd, bias=bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(n_embd, n_embd*k, bias=bias)
-        self.v_emb = nn.Embedding(vocab_size, n_embd*k)
-        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.001)
+        v_size = 64 #n_embd*k
+        self.c_proj  = nn.Linear(2*n_embd, v_size, bias=bias)
+        self.v_emb = nn.Embedding(vocab_size, v_size)
+        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.01)
+        torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
+        torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
+        self.vector_db = None
 
     def forward(self, x, targets):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
         dist = torch.cdist(x, self.v_emb.weight, p=2)
-        loss = torch.cdist(dist, targets, p=2)
+        targets_ = 1 / (1e-3 + targets)
+        targets_.log_()
+        loss = torch.cdist(dist, targets_, p=2)
         #x = x @ self.v_emb.weight.T
         #loss = torch.mean(torch.norm(x - targets, p=2, dim=1))
         # loss = F.cosine_embedding_loss(input1=targets, input2=x, target=torch.ones(x.shape[0], device=x.device))
         # loss2 = torch.mean(torch.abs(torch.eye(self.n_embd, device=x.device) - self.v_emb.weight.T @ self.v_emb.weight))
         # loss2 = torch.mean(torch.abs(1 - torch.norm(self.v_emb.weight, p=2, dim=1)))
         return torch.mean(loss)# + loss2, loss2
+
+    def prepare(self):
+        if os.path.exists("vector_db.bin"):
+            self.vector_db = hnswlib.Index(space='l2', dim=self.v_emb.weight.shape[1])
+            self.vector_db.load_index("vector_db.bin")
+        else:
+            data = self.v_emb.weight.detach_().cpu().numpy()
+            num_elements, dim = data.shape
+            p = hnswlib.Index(space='l2', dim=dim)
+            p.init_index(max_elements=num_elements, ef_construction=100, M=64)
+            p.set_ef(50)
+            p.set_num_threads(4)
+            p.add_items(data)
+            self.vector_db = p
+            self.vector_db.save_index("vector_db.bin")
+
+    def predict(self, x):
+        dev = x.device
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = x.view((-1, x.shape[-1])).cpu().to(dtype=torch.float32).numpy()
+        label, dist = self.vector_db.knn_query(x, k=1)
+        return torch.tensor(label, dtype=torch.int64, device=dev)
 
 
 class LayerNorm(nn.Module):
@@ -332,17 +362,19 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, v2e_model, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        idx2 = torch.tensor(idx)
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, x = self(idx_cond)
+
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -355,5 +387,7 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+            # todo predict base on idx2
+            idx_next2 = v2e_model.predict(x[0, -1])
+            idx2 = torch.cat((idx2, idx_next2), dim=1)
+        return idx, idx2

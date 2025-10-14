@@ -9,6 +9,7 @@ import torch
 from vector_model3 import GPTConfig, GPT, Emb2VectMLP
 from torch.nn import functional as F
 
+compile = True # use PyTorch 2.0 to compile the model to be faster
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -22,7 +23,6 @@ block_size = 1024
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -92,7 +92,7 @@ def collect_data():
         probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
         return x.view((-1, x.shape[2])), probs
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=2)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=1)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -139,17 +139,20 @@ while True:
     with ctx:
         loss = v2e_model(X, Y)
     if iter_num % eval_interval == 0:
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
         iloss = loss.item()
         # iloss = loss1.item()
         # print(f"iter {iter_num}: loss {iloss:.4f} {iloss1:.4f} , time {dt * 1000:.2f}ms ")
         print(f"iter {iter_num}: loss {iloss:.4f}, time {dt * 1000:.2f}ms ")
     if iter_num % eval_interval*10 == 0:
-        torch.save(model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
+        torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
 
 
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
+    # loss.backward()
+    # optimizer.step()
+    # optimizer.zero_grad()
 
     # timing and logging
     t1 = time.time()
@@ -159,4 +162,4 @@ while True:
     if iter_num > max_iters:
         break
 
-torch.save(model.state_dict(), os.path.join(out_dir, 'final-ckpt.pt'))
+torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'final-ckpt.pt'))
