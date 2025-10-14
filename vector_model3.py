@@ -20,14 +20,15 @@ from torch.nn import functional as F
 
 class Emb2VectMLP(nn.Module):
 
-    def __init__(self, vocab_size=50304, n_embd=768, bias=False, k=1):
+    def __init__(self, vocab_size=50304, n_embd=768, v_size=256, bias=False, k=2):
         super().__init__()
         self.vocab_size = vocab_size
+        self.k = k
+        self.v_size = v_size
         self.n_embd = n_embd
-        self.c_fc    = nn.Linear(n_embd, 2*n_embd, bias=bias)
-        self.gelu    = nn.GELU()
-        v_size = 64 #n_embd*k
-        self.c_proj  = nn.Linear(2*n_embd, v_size, bias=bias)
+        self.c_fc    = nn.Linear(n_embd, k*n_embd, bias=bias)
+        self.act    = nn.Sigmoid()
+        self.c_proj  = nn.Linear(k*n_embd, v_size, bias=bias)
         self.v_emb = nn.Embedding(vocab_size, v_size)
         torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.01)
         torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
@@ -36,18 +37,23 @@ class Emb2VectMLP(nn.Module):
 
     def forward(self, x, targets):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.act(x)
         x = self.c_proj(x)
         dist = torch.cdist(x, self.v_emb.weight, p=2)
         targets_ = 1 / (1e-3 + targets)
         targets_.log_()
-        loss = torch.cdist(dist, targets_, p=2)
+        dist = dist #.clip(max=math.log(1000))
+        loss = (dist - targets_)*(dist - targets_) #torch.cdist(dist, targets_, p=2, )
+        tmp = torch.abs(dist - targets_)
+        v1, idx = tmp.topk(k=5, largest=False, dim=1)
+        v2, idx2 = targets.topk(k=5, largest=True, dim=1)
         #x = x @ self.v_emb.weight.T
         #loss = torch.mean(torch.norm(x - targets, p=2, dim=1))
         # loss = F.cosine_embedding_loss(input1=targets, input2=x, target=torch.ones(x.shape[0], device=x.device))
         # loss2 = torch.mean(torch.abs(torch.eye(self.n_embd, device=x.device) - self.v_emb.weight.T @ self.v_emb.weight))
         # loss2 = torch.mean(torch.abs(1 - torch.norm(self.v_emb.weight, p=2, dim=1)))
-        return torch.mean(loss)# + loss2, loss2
+        good = idx[:] == idx2[:]
+        return torch.mean(loss), good.sum() / good.shape[0] / good.shape[1]
 
     def prepare(self):
         if os.path.exists("vector_db.bin"):
@@ -67,7 +73,7 @@ class Emb2VectMLP(nn.Module):
     def predict(self, x):
         dev = x.device
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.act(x)
         x = self.c_proj(x)
         x = x.view((-1, x.shape[-1])).cpu().to(dtype=torch.float32).numpy()
         label, dist = self.vector_db.knn_query(x, k=1)

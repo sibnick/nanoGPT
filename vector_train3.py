@@ -3,6 +3,7 @@ import os
 import pickle
 import time
 from contextlib import nullcontext
+from itertools import accumulate
 
 import numpy as np
 import torch
@@ -92,15 +93,15 @@ def collect_data():
         probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
         return x.view((-1, x.shape[2])), probs
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=1)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=1, v_size=256, bias=False)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_v2e_model = v2e_model
     v2e_model = torch.compile(v2e_model) # requires PyTorch 2.0
 # training loop
-warmup_iters = 1000
-learning_rate = 1e-3
+warmup_iters = 100
+learning_rate = 1e-4
 min_lr = learning_rate/100
 lr_decay_iters = 10000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -110,10 +111,14 @@ beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
 out_dir = "out_head"
-eval_interval = 10
+accumulate_interval = 10
 max_iters = 10_000
 t0 = time.time()
 dt = 0
+import torch
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter(comment=f"Params k={v2e_model.k} v_emb={v2e_model.v_size}")
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -137,16 +142,19 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     with ctx:
-        loss = v2e_model(X, Y)
-    if iter_num % eval_interval == 0:
+        loss, good = v2e_model(X, Y)
+    if iter_num % accumulate_interval == 0:
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
         iloss = loss.item()
         # iloss = loss1.item()
         # print(f"iter {iter_num}: loss {iloss:.4f} {iloss1:.4f} , time {dt * 1000:.2f}ms ")
-        print(f"iter {iter_num}: loss {iloss:.4f}, time {dt * 1000:.2f}ms ")
-    if iter_num % eval_interval*10 == 0:
+        writer.add_scalar("Loss/iter", loss, iter_num)
+        writer.add_scalar("Good/iter", good, iter_num)
+        print(f"iter {iter_num}: loss {iloss:.4f}, good {good:.4f}, time {dt * 1000:.2f}ms ")
+    if iter_num % accumulate_interval*10 == 0:
+        writer.flush()
         torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
 
 
@@ -161,5 +169,5 @@ while True:
     iter_num += 1
     if iter_num > max_iters:
         break
-
+writer.close()
 torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'final-ckpt.pt'))
