@@ -93,7 +93,7 @@ def collect_data():
         probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
         return x.view((-1, x.shape[2])), probs
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=1, v_size=256, bias=False)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=False)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -101,7 +101,7 @@ if compile:
     v2e_model = torch.compile(v2e_model) # requires PyTorch 2.0
 # training loop
 warmup_iters = 100
-learning_rate = 1e-4
+learning_rate = 5e-3
 min_lr = learning_rate/100
 lr_decay_iters = 10000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -142,7 +142,7 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     with ctx:
-        loss, good = v2e_model(X, Y)
+        loss, good1, good5 = v2e_model(X, Y)
     if iter_num % accumulate_interval == 0:
         loss.backward()
         optimizer.step()
@@ -151,11 +151,13 @@ while True:
         # iloss = loss1.item()
         # print(f"iter {iter_num}: loss {iloss:.4f} {iloss1:.4f} , time {dt * 1000:.2f}ms ")
         writer.add_scalar("Loss/iter", loss, iter_num)
-        writer.add_scalar("Good/iter", good, iter_num)
-        print(f"iter {iter_num}: loss {iloss:.4f}, good {good:.4f}, time {dt * 1000:.2f}ms ")
+        writer.add_scalar("Top1/iter", good1, iter_num)
+        writer.add_scalar("Top5/iter", good5, iter_num)
+        print(f"iter {iter_num}: loss {iloss:3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
     if iter_num % accumulate_interval*10 == 0:
         writer.flush()
         torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
+        #v2e_model.C += 0.01
 
 
     # loss.backward()

@@ -27,33 +27,52 @@ class Emb2VectMLP(nn.Module):
         self.v_size = v_size
         self.n_embd = n_embd
         self.c_fc    = nn.Linear(n_embd, k*n_embd, bias=bias)
-        self.act    = nn.Sigmoid()
-        self.c_proj  = nn.Linear(k*n_embd, v_size, bias=bias)
+        self.act    = nn.GELU()
+        self.c_fc2    = nn.Linear(k*n_embd, n_embd, bias=bias)
+        self.act2    = nn.GELU()
+        self.c_proj  = nn.Linear(n_embd, v_size, bias=bias)
         self.v_emb = nn.Embedding(vocab_size, v_size)
-        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.01)
+        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
         torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
         torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
         self.vector_db = None
+        self.C = 0.1
 
     def forward(self, x, targets):
-        x = self.c_fc(x)
-        x = self.act(x)
-        x = self.c_proj(x)
-        dist = torch.cdist(x, self.v_emb.weight, p=2)
         targets_ = 1 / (1e-3 + targets)
         targets_.log_()
-        dist = dist #.clip(max=math.log(1000))
-        loss = (dist - targets_)*(dist - targets_) #torch.cdist(dist, targets_, p=2, )
-        tmp = torch.abs(dist - targets_)
-        v1, idx = tmp.topk(k=5, largest=False, dim=1)
-        v2, idx2 = targets.topk(k=5, largest=True, dim=1)
-        #x = x @ self.v_emb.weight.T
-        #loss = torch.mean(torch.norm(x - targets, p=2, dim=1))
-        # loss = F.cosine_embedding_loss(input1=targets, input2=x, target=torch.ones(x.shape[0], device=x.device))
-        # loss2 = torch.mean(torch.abs(torch.eye(self.n_embd, device=x.device) - self.v_emb.weight.T @ self.v_emb.weight))
-        # loss2 = torch.mean(torch.abs(1 - torch.norm(self.v_emb.weight, p=2, dim=1)))
-        good = idx[:] == idx2[:]
-        return torch.mean(loss), good.sum() / good.shape[0] / good.shape[1]
+        correct_dist, correct_idx = targets_.topk(k=1, largest=False, dim=1)
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_fc2(x)
+        x = self.act2(x)
+        x = self.c_proj(x)
+        dist = torch.cdist(x, self.v_emb.weight, p=2)
+        v1, idx = dist.topk(k=5, largest=False, dim=1)
+        loss = F.mse_loss(dist, targets_, reduction="none")
+        loss = loss * (targets + self.C)
+        good1 = idx[:, 0] == correct_idx[:, 0]
+        good5 = idx[:] == correct_idx[:]
+        good1 = good1.sum() / good1.shape[0]
+        good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
+        return loss.mean(), good1, good5
+
+    # def forward_cos(self, x, targets):
+    #     targets_ = targets
+    #     correct_dist, correct_idx = targets_.topk(k=1, largest=False, dim=1)
+    #     x = self.c_fc(x)
+    #     x = self.act(x)
+    #     x = self.c_proj(x)
+    #     x1_normalized = F.normalize(x, p=2, dim=-1)
+    #     x2_normalized = F.normalize(self.v_emb.weight, p=2, dim=-1)
+    #     dist = torch.cdist(x1_normalized, x2_normalized, p=2)
+    #     v1, idx = dist.topk(k=5, largest=False, dim=1)
+    #     loss = F.cosine_embedding_loss(input1=targets_, input2=dist, target=torch.ones(dist.shape[0], device=x.device), reduction="none")
+    #     good1 = idx[:, 0] == correct_idx[:, 0]
+    #     good5 = idx[:] == correct_idx[:]
+    #     good1 = good1.sum() / good1.shape[0]
+    #     good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
+    #     return loss.mean(), good1, good5
 
     def prepare(self):
         if os.path.exists("vector_db.bin"):
@@ -74,10 +93,13 @@ class Emb2VectMLP(nn.Module):
         dev = x.device
         x = self.c_fc(x)
         x = self.act(x)
+        x = self.c_fc2(x)
+        x = self.act2(x)
         x = self.c_proj(x)
         x = x.view((-1, x.shape[-1])).cpu().to(dtype=torch.float32).numpy()
-        label, dist = self.vector_db.knn_query(x, k=1)
-        return torch.tensor(label, dtype=torch.int64, device=dev)
+        label, dist = self.vector_db.knn_query(x, k=5)
+        ans = label[0,1]
+        return torch.tensor(ans[None, None], dtype=torch.int64, device=dev)
 
 
 class LayerNorm(nn.Module):

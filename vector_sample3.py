@@ -32,9 +32,9 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-emb2vect = Emb2VectMLP(vocab_size=50257, k=2)
+emb2vect =  Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=False)
 ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-state_dict = torch.load("out_head/final-ckpt.pt", map_location=device)
+state_dict = torch.load("out_head/ckpt.pt", map_location=device)
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
@@ -65,7 +65,7 @@ x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y, y2 = model.generate(x, emb2vect, max_new_tokens, temperature=temperature, top_k=top_k)
+            y, y1 = model.generate(x, emb2vect, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
-            print(decode(y2[0].tolist()))
             print('---------------')
+            print(decode(y1[0].tolist()))
