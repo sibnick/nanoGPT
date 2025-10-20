@@ -32,7 +32,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-emb2vect =  Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=False)
+emb2vect =  Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=True)
 ckpt_path = os.path.join(out_dir, 'ckpt.pt')
 state_dict = torch.load("out_head/ckpt.pt", map_location=device)
 unwanted_prefix = '_orig_mod.'

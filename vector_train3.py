@@ -19,7 +19,7 @@ out_dir = 'out_v3'
 init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # data
 dataset = 'openwebtext'
-batch_size = 12
+batch_size = 16
 block_size = 1024
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -93,15 +93,15 @@ def collect_data():
         probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
         return x.view((-1, x.shape[2])), probs
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=False)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=True)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_v2e_model = v2e_model
     v2e_model = torch.compile(v2e_model) # requires PyTorch 2.0
 # training loop
-warmup_iters = 100
-learning_rate = 5e-3
+warmup_iters = 1000
+learning_rate = 1e-3
 min_lr = learning_rate/100
 lr_decay_iters = 10000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -143,11 +143,11 @@ while True:
         param_group['lr'] = lr
     with ctx:
         loss, good1, good5 = v2e_model(X, Y)
-    if iter_num % accumulate_interval == 0:
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
         iloss = loss.item()
+    if iter_num % accumulate_interval == 0:
         # iloss = loss1.item()
         # print(f"iter {iter_num}: loss {iloss:.4f} {iloss1:.4f} , time {dt * 1000:.2f}ms ")
         writer.add_scalar("Loss/iter", loss, iter_num)

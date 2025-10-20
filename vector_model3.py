@@ -27,11 +27,11 @@ class Emb2VectMLP(nn.Module):
         self.k = k
         self.v_size = v_size
         self.n_embd = n_embd
-        self.c_fc    = nn.Linear(n_embd, k*n_embd, bias=bias)
-        self.act    = nn.GELU()
-        # self.c_fc2    = nn.Linear(k*n_embd, n_embd, bias=bias)
-        # self.act2    = nn.GELU()
-        self.c_proj  = nn.Linear(k*n_embd, v_size, bias=bias)
+        self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
+        self.act = nn.GELU()
+        self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
+        self.act2 = nn.GELU()
+        self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
         self.v_emb = nn.Embedding(vocab_size, v_size)
         torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
         torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
@@ -46,29 +46,25 @@ class Emb2VectMLP(nn.Module):
         correct_dist, correct_idx = targets_.topk(k=1, largest=False, dim=1)
         x = self.c_fc(x)
         x = self.act(x)
-        # x = self.c_fc2(x)
-        # x = self.act2(x)
+        x = self.c_fc2(x)
+        x = self.act2(x)
         x = self.c_proj(x)
         dist = torch.cdist(x, self.v_emb.weight, p=2)
         v1, idx = dist.topk(k=5, largest=False, dim=1)
 
-        tmp = targets.argmax(dim=1)
-        loss = F.mse_loss(dist[:,tmp], targets_[:, tmp], reduction="none")
-
-        # tmp = dist.argmax(dim=1)
-        # loss += F.mse_loss(dist[:,tmp], targets_[:, tmp], reduction="none")
+        _, tmp = targets.topk(k=5, largest=True, dim=1)
+        t0 = tmp[:, 0]
+        t1 = tmp[:, 1]
+        loss = F.mse_loss(dist[:, t0], targets_[:, t0], reduction="mean")
+        loss += F.mse_loss(dist[:, t1], targets_[:, t1], reduction="mean")
+        # loss = F.mse_loss(dist, targets_, reduction="mean")
 
         good1 = idx[:, 0] == correct_idx[:, 0]
         good5 = idx[:] == correct_idx[:]
         good1 = good1.sum() / good1.shape[0]
         good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
 
-        # l2_reg = torch.tensor(0., device=x.device)
-        # for param in self.parameters():
-        #     if param.requires_grad:
-        l2_reg = 0#torch.norm(self.c_fc.weight, p=2).pow(2)
-        # l2_reg += torch.norm(self.c_fc2.weight, p=2).pow(2)
-        return loss.mean() + self.lambda_l2 * l2_reg, good1, good5
+        return loss, good1, good5
 
     # def forward_cos(self, x, targets):
     #     targets_ = targets
