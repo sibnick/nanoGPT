@@ -19,7 +19,7 @@ out_dir = 'out_v3'
 init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # data
 dataset = 'openwebtext'
-batch_size = 16
+batch_size = 24
 block_size = 1024
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -91,11 +91,11 @@ def collect_data():
     X, Y = get_batch('train')
     with ctx:
         logits, _, x = model(X, Y)
-        #probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
-        #return x.view((-1, x.shape[2])), probs
-        return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
+        probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
+        return x.view((-1, x.shape[2])), probs
+        # return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=1, v_size=256, bias=True)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=True)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -103,7 +103,7 @@ if compile:
     v2e_model = torch.compile(v2e_model) # requires PyTorch 2.0
 # training loop
 warmup_iters = 100
-learning_rate = 1e-2
+learning_rate = 1e-3
 min_lr = learning_rate/100
 lr_decay_iters = 10000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -111,7 +111,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-decay_lr = True
+decay_lr = False
 out_dir = "out_head"
 accumulate_interval = 10
 max_iters = 10_000

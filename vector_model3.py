@@ -39,8 +39,8 @@ class Emb2VectMLP(nn.Module):
         # self.act2 = nn.GELU()
         self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
         self.v_emb = nn.Embedding(vocab_size, v_size)
-        # torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
-        # torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
+        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
+        torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
         # torch.nn.init.normal_(self.c_fc2.weight, mean=0.0, std=0.01)
         # torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
         self.vector_db = None
@@ -66,7 +66,7 @@ class Emb2VectMLP(nn.Module):
             good1 = good1.sum() / good1.shape[0]
             good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
             return loss, good1, good5
-        return loss, None, None
+        return loss + 0.1*torch.mean(self.v_emb.weight @ self.v_emb.weight.T), None, None
 
     # def forward_cos(self, x, targets):
     #     targets_ = targets
