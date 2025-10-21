@@ -47,7 +47,8 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    data_len = len(data) #min(len(data), 11_024)
+    ix = torch.randint(data_len - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
@@ -90,18 +91,19 @@ def collect_data():
     X, Y = get_batch('train')
     with ctx:
         logits, _, x = model(X, Y)
-        probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
-        return x.view((-1, x.shape[2])), probs
+        #probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
+        #return x.view((-1, x.shape[2])), probs
+        return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=True)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=1, v_size=256, bias=True)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_v2e_model = v2e_model
     v2e_model = torch.compile(v2e_model) # requires PyTorch 2.0
 # training loop
-warmup_iters = 1000
-learning_rate = 1e-3
+warmup_iters = 100
+learning_rate = 1e-2
 min_lr = learning_rate/100
 lr_decay_iters = 10000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -142,18 +144,18 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     with ctx:
+        v2e_model.calc_metrics = (iter_num % accumulate_interval == 0)
         loss, good1, good5 = v2e_model(X, Y)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-        iloss = loss.item()
-    if iter_num % accumulate_interval == 0:
+    if v2e_model.calc_metrics:
         # iloss = loss1.item()
         # print(f"iter {iter_num}: loss {iloss:.4f} {iloss1:.4f} , time {dt * 1000:.2f}ms ")
         writer.add_scalar("Loss/iter", loss, iter_num)
         writer.add_scalar("Top1/iter", good1, iter_num)
         writer.add_scalar("Top5/iter", good5, iter_num)
-        print(f"iter {iter_num}: loss {iloss:3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
+        print(f"iter {iter_num}: loss {loss.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
     if iter_num % accumulate_interval*10 == 0:
         writer.flush()
         torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))

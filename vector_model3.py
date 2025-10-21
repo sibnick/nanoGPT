@@ -17,6 +17,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+def sim_matrix(a, b, eps=1e-8):
+    a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
+    a_norm = a / torch.clamp(a_n, min=eps)
+    b_norm = b / torch.clamp(b_n, min=eps)
+    sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
+    return sim_mt
 
 class Emb2VectMLP(nn.Module):
 
@@ -29,42 +35,38 @@ class Emb2VectMLP(nn.Module):
         self.n_embd = n_embd
         self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
         self.act = nn.GELU()
-        self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
-        self.act2 = nn.GELU()
+        # self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
+        # self.act2 = nn.GELU()
         self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
         self.v_emb = nn.Embedding(vocab_size, v_size)
-        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
-        torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
+        # torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
+        # torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
         # torch.nn.init.normal_(self.c_fc2.weight, mean=0.0, std=0.01)
-        torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
+        # torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
         self.vector_db = None
         self.C = C
+        self.calc_metrics = False
 
     def forward(self, x, targets):
-        targets_ = 1 / (1e-3 + targets)
-        targets_.log_()
-        correct_dist, correct_idx = targets_.topk(k=1, largest=False, dim=1)
+        # targets_ = 1 / (1e-4 + targets)
+        # targets_.log_()
         x = self.c_fc(x)
         x = self.act(x)
-        x = self.c_fc2(x)
-        x = self.act2(x)
+        # x = self.c_fc2(x)
+        # x = self.act2(x)
         x = self.c_proj(x)
-        dist = torch.cdist(x, self.v_emb.weight, p=2)
-        v1, idx = dist.topk(k=5, largest=False, dim=1)
+        dist = sim_matrix(x, self.v_emb.weight)/2 + 0.5
+        loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=torch.ones(dist.shape[0], device=x.device), reduction="mean")
+        if self.calc_metrics:
+            _, correct_idx = targets.topk(k=5, largest=True, dim=1)
+            v1, idx = dist.topk(k=5, largest=True, dim=1)
 
-        _, tmp = targets.topk(k=5, largest=True, dim=1)
-        t0 = tmp[:, 0]
-        t1 = tmp[:, 1]
-        loss = F.mse_loss(dist[:, t0], targets_[:, t0], reduction="mean")
-        loss += F.mse_loss(dist[:, t1], targets_[:, t1], reduction="mean")
-        # loss = F.mse_loss(dist, targets_, reduction="mean")
-
-        good1 = idx[:, 0] == correct_idx[:, 0]
-        good5 = idx[:] == correct_idx[:]
-        good1 = good1.sum() / good1.shape[0]
-        good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
-
-        return loss, good1, good5
+            good1 = idx[:, 0] == correct_idx[:, 0]
+            good5 = idx[:] == correct_idx[:]
+            good1 = good1.sum() / good1.shape[0]
+            good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
+            return loss, good1, good5
+        return loss, None, None
 
     # def forward_cos(self, x, targets):
     #     targets_ = targets
@@ -85,7 +87,7 @@ class Emb2VectMLP(nn.Module):
 
     def prepare(self):
         if os.path.exists("vector_db.bin"):
-            self.vector_db = hnswlib.Index(space='l2', dim=self.v_emb.weight.shape[1])
+            self.vector_db = hnswlib.Index(space='cosine', dim=self.v_emb.weight.shape[1])
             self.vector_db.load_index("vector_db.bin")
         else:
             data = self.v_emb.weight.detach_().cpu().numpy()
