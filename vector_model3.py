@@ -46,6 +46,7 @@ class Emb2VectMLP(nn.Module):
         self.vector_db = None
         self.C = C
         self.calc_metrics = False
+        self.ones = None
 
     def forward(self, x, targets):
         # targets_ = 1 / (1e-4 + targets)
@@ -56,7 +57,12 @@ class Emb2VectMLP(nn.Module):
         # x = self.act2(x)
         x = self.c_proj(x)
         dist = sim_matrix(x, self.v_emb.weight)/2 + 0.5
-        loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=torch.ones(dist.shape[0], device=x.device), reduction="mean")
+        if self.ones is None:
+            self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
+        loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, margin=1e-3, reduction="mean")
+        # t = sim_matrix(self.v_emb.weight, self.v_emb.weight).abs().mean()
+        # loss = loss.mean() + t
+        loss = loss.mean()
         if self.calc_metrics:
             _, correct_idx = targets.topk(k=5, largest=True, dim=1)
             v1, idx = dist.topk(k=5, largest=True, dim=1)
@@ -66,7 +72,7 @@ class Emb2VectMLP(nn.Module):
             good1 = good1.sum() / good1.shape[0]
             good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
             return loss, good1, good5
-        return loss + 0.1*torch.mean(self.v_emb.weight @ self.v_emb.weight.T), None, None
+        return loss, None, None
 
     # def forward_cos(self, x, targets):
     #     targets_ = targets

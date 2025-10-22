@@ -95,7 +95,7 @@ def collect_data():
         return x.view((-1, x.shape[2])), probs
         # return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
 
-v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=True)
+v2e_model = Emb2VectMLP(vocab_size=50257, k=2, v_size=512, bias=True)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
