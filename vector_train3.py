@@ -109,10 +109,10 @@ if compile:
 warmup_iters = 100
 learning_rate = 1e-3
 min_lr = learning_rate/100
-lr_decay_iters = 10000
+lr_decay_iters = 10_000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-weight_decay = 1e-3
+weight_decay = 1e-6
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
@@ -160,7 +160,8 @@ while True:
         writer.add_scalar("Loss2/iter", loss2, iter_num)
         writer.add_scalar("Top1/iter", good1, iter_num)
         writer.add_scalar("Top5/iter", good5, iter_num)
-        print(f"iter {iter_num}: loss {loss.item():3e}, loss2 {loss2.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
+        writer.add_scalar("lr", lr, iter_num)
+        print(f"iter/lr {iter_num}/{lr:3e}: loss {loss.item():3e}, loss2 {loss2.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
     if iter_num % accumulate_interval*10 == 0:
         writer.flush()
         torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
