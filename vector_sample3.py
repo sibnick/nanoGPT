@@ -31,24 +31,24 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+model.eval()
+model.to(device)
+if compile:
+    model = torch.compile(model) # requires PyTorch 2.0 (optional)
 # model
-emb2vect =  Emb2VectMLP(vocab_size=50257, k=2, v_size=768, bias=True)
+emb2vect =  Emb2VectMLP(v_emb=model.transformer.wte, vocab_size=50257, k=4, v_size=768, bias=True)
 ckpt_path = os.path.join(out_dir, 'ckpt.pt')
 state_dict = torch.load("out_head/ckpt.pt", map_location=device)
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+state_dict["v_emb.weight"] = model.transformer.wte.weight
 emb2vect.load_state_dict(state_dict)
 emb2vect.eval()
 emb2vect.prepare()
 emb2vect.to(device)
-
-model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-model.eval()
-model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
 enc = tiktoken.get_encoding("gpt2")
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})

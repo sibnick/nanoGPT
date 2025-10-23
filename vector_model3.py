@@ -26,7 +26,7 @@ def sim_matrix(a, b, eps=1e-8):
 
 class Emb2VectMLP(nn.Module):
 
-    def __init__(self, vocab_size=50304, n_embd=768, v_size=256, bias=False, k=2, lambda_l2=0.001, C = 0.01):
+    def __init__(self, v_emb, vocab_size=50304, n_embd=768, v_size=256, bias=False, k=2, lambda_l2=0.001, C = 0.01):
         super().__init__()
         self.vocab_size = vocab_size
         self.lambda_l2 = lambda_l2
@@ -35,34 +35,27 @@ class Emb2VectMLP(nn.Module):
         self.n_embd = n_embd
         self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
         self.act = nn.GELU()
-        # self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
-        # self.act2 = nn.GELU()
         self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
-        self.v_emb = nn.Embedding(vocab_size, v_size)
-        torch.nn.init.normal_(self.v_emb.weight, mean=0.0, std=0.1)
-        torch.nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.01)
-        # torch.nn.init.normal_(self.c_fc2.weight, mean=0.0, std=0.01)
-        # torch.nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
+        self.v_emb = v_emb
         self.vector_db = None
         self.C = C
         self.calc_metrics = False
         self.ones = None
 
     def forward(self, x, targets):
-        # targets_ = 1 / (1e-4 + targets)
-        # targets_.log_()
         x = self.c_fc(x)
         x = self.act(x)
-        # x = self.c_fc2(x)
-        # x = self.act2(x)
         x = self.c_proj(x)
-        dist = sim_matrix(x, self.v_emb.weight)/2 + 0.5
+        x = F.tanh(x)
+        dist = sim_matrix(x, self.v_emb)
         if self.ones is None:
-            self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
-        loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, margin=1e-3, reduction="mean")
+             self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
+        loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, reduction="mean")
+        # loss = F.mse_loss(targets, dist, reduction="mean")
         # t = sim_matrix(self.v_emb.weight, self.v_emb.weight).abs().mean()
-        # loss = loss.mean() + t
-        loss = loss.mean()
+        # loss = loss + t
+        loss2 = ((1 - dist.sum(dim=1)).abs().mean())
+        #loss = loss + loss2
         if self.calc_metrics:
             _, correct_idx = targets.topk(k=5, largest=True, dim=1)
             v1, idx = dist.topk(k=5, largest=True, dim=1)
@@ -71,8 +64,8 @@ class Emb2VectMLP(nn.Module):
             good5 = idx[:] == correct_idx[:]
             good1 = good1.sum() / good1.shape[0]
             good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
-            return loss, good1, good5
-        return loss, None, None
+            return loss, loss2, good1, good5
+        return loss, loss2, None, None
 
     # def forward_cos(self, x, targets):
     #     targets_ = targets
@@ -98,7 +91,7 @@ class Emb2VectMLP(nn.Module):
         else:
             data = self.v_emb.weight.detach_().cpu().numpy()
             num_elements, dim = data.shape
-            p = hnswlib.Index(space='l2', dim=dim)
+            p = hnswlib.Index(space='cosine', dim=dim)
             p.init_index(max_elements=num_elements, ef_construction=100, M=64)
             p.set_ef(50)
             p.set_num_threads(4)
@@ -110,9 +103,8 @@ class Emb2VectMLP(nn.Module):
         dev = x.device
         x = self.c_fc(x)
         x = self.act(x)
-        # x = self.c_fc2(x)
-        # x = self.act2(x)
         x = self.c_proj(x)
+        x = F.tanh(x)
         x = x.view((-1, x.shape[-1])).cpu().to(dtype=torch.float32).numpy()
         label, dist = self.vector_db.knn_query(x, k=5)
         ans = label[0,1]
