@@ -10,7 +10,9 @@ import torch
 from vector_model3 import GPTConfig, GPT, Emb2VectMLP
 from torch.nn import functional as F
 
-compile = True # use PyTorch 2.0 to compile the model to be faster
+# use PyTorch 2.0 to compile the model to be faster
+compile = True
+# compile = False
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -35,9 +37,10 @@ torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
+# dtype = 'float32'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-#ctx = nullcontext()#if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+# ctx = nullcontext()#if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -93,13 +96,25 @@ def collect_data():
     X, Y = get_batch('train')
     with ctx:
         logits, _, x = model(X, Y)
-        probs = F.softmax(logits.view((-1, logits.shape[2])), dim=1)
-        return x.view((-1, x.shape[2])), probs
+        logits = logits.view((-1, logits.shape[2]))
+        probs = F.softmax(logits, dim=1)
+        probs = F.relu(probs - 1e-2)
+        x = x.view((-1, x.shape[2]))
+        x = F.tanh(x) #F.layer_norm(x, x.shape)
+        return x, probs
         # return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
+
+@torch.no_grad()
+def collect_rnd_data():
+    with ctx:
+        X = 2 * torch.rand((block_size * batch_size, 768), requires_grad=False, device=model.lm_head.weight.device) - 1
+        Y = model.lm_head(X)
+        probs = F.softmax(Y, dim=1)
+        return X, probs
 
 
 weight = model.lm_head.weight.clone().detach().requires_grad_(False)
-v2e_model = Emb2VectMLP(weight, vocab_size=50257, k=4, v_size=768, bias=True)
+v2e_model = Emb2VectMLP(weight, vocab_size=50257, k=2, v_size=768, bias=True)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -112,10 +127,11 @@ min_lr = learning_rate/100
 lr_decay_iters = 10_000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-weight_decay = 1e-6
+weight_decay = 1e-3
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
+decay_lr = False
 out_dir = "out_head"
 accumulate_interval = 10
 max_iters = 10_000
@@ -154,23 +170,14 @@ while True:
         optimizer.step()
         optimizer.zero_grad()
     if v2e_model.calc_metrics:
-        # iloss = loss1.item()
-        # print(f"iter {iter_num}: loss {iloss:.4f} {iloss1:.4f} , time {dt * 1000:.2f}ms ")
         writer.add_scalar("Loss/iter", loss, iter_num)
         writer.add_scalar("Loss2/iter", loss2, iter_num)
         writer.add_scalar("Top1/iter", good1, iter_num)
         writer.add_scalar("Top5/iter", good5, iter_num)
-        writer.add_scalar("lr", lr, iter_num)
         print(f"iter/lr {iter_num}/{lr:3e}: loss {loss.item():3e}, loss2 {loss2.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
     if iter_num % accumulate_interval*10 == 0:
         writer.flush()
         torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
-        #v2e_model.C += 0.01
-
-
-    # loss.backward()
-    # optimizer.step()
-    # optimizer.zero_grad()
 
     # timing and logging
     t1 = time.time()

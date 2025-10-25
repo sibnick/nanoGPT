@@ -35,6 +35,8 @@ class Emb2VectMLP(nn.Module):
         self.n_embd = n_embd
         self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
         self.act = nn.GELU()
+        # self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
+        # self.act2 = nn.GELU()
         self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
         self.v_emb = v_emb
         self.vector_db = None
@@ -45,17 +47,23 @@ class Emb2VectMLP(nn.Module):
     def forward(self, x, targets):
         x = self.c_fc(x)
         x = self.act(x)
+        # x = self.c_fc2(x)
+        # x = self.act2(x)
         x = self.c_proj(x)
-        x = F.tanh(x)
+        x = F.layer_norm(x, x.shape)
+        #x = F.sigmoid(x)
         dist = sim_matrix(x, self.v_emb)
+        dist = F.relu(dist.abs() - 1e-2)
+
         if self.ones is None:
-             self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
+            self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
         loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, reduction="mean")
         # loss = F.mse_loss(targets, dist, reduction="mean")
+        loss2 = loss
         # t = sim_matrix(self.v_emb.weight, self.v_emb.weight).abs().mean()
         # loss = loss + t
-        loss2 = ((1 - dist.sum(dim=1)).abs().mean())
-        #loss = loss + loss2
+        # loss2 = torch.abs(1 - (dist*dist).sum(dim=1)).mean()
+        # loss = loss + loss2 * 0.01
         if self.calc_metrics:
             _, correct_idx = targets.topk(k=5, largest=True, dim=1)
             v1, idx = dist.topk(k=5, largest=True, dim=1)
