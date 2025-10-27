@@ -37,7 +37,7 @@ model.to(device)
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 # model
-emb2vect =  Emb2VectMLP(v_emb=model.transformer.wte, vocab_size=50257, k=4, v_size=768, bias=True)
+emb2vect =  Emb2VectMLP(v_emb=model.transformer.wte, vocab_size=50257, k=2, v_size=768, bias=True)
 ckpt_path = os.path.join(out_dir, 'ckpt.pt')
 state_dict = torch.load("out_head/ckpt.pt", map_location=device)
 unwanted_prefix = '_orig_mod.'

@@ -98,9 +98,12 @@ def collect_data():
         logits, _, x = model(X, Y)
         logits = logits.view((-1, logits.shape[2]))
         probs = F.softmax(logits, dim=1)
-        probs = F.relu(probs - 1e-2)
+        # probs[probs < probs.mean(dim=0)] = 0
+        # probs = 1 - F.softmax(logits, dim=1)
+        #probs = F.relu(probs - probs.mean(dim=0))
         x = x.view((-1, x.shape[2]))
-        x = F.tanh(x) #F.layer_norm(x, x.shape)
+        #x = F.tanh(F.layer_norm(x, x.shape))
+        x = F.tanh(x)
         return x, probs
         # return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
 
@@ -131,7 +134,7 @@ weight_decay = 1e-3
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
-decay_lr = False
+decay_lr = True
 out_dir = "out_head"
 accumulate_interval = 10
 max_iters = 10_000
