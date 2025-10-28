@@ -98,26 +98,36 @@ def collect_data():
         logits, _, x = model(X, Y)
         logits = logits.view((-1, logits.shape[2]))
         probs = F.softmax(logits, dim=1)
-        # probs[probs < probs.mean(dim=0)] = 0
-        # probs = 1 - F.softmax(logits, dim=1)
-        #probs = F.relu(probs - probs.mean(dim=0))
         x = x.view((-1, x.shape[2]))
-        #x = F.tanh(F.layer_norm(x, x.shape))
         x = F.tanh(x)
+        # zeros = torch.zeros((x.shape[0], 47), dtype=x.dtype, device=x.device)
+        # probs = torch.cat((probs, zeros), dim=1)
         return x, probs
-        # return x.view((-1, x.shape[2])), logits.view((-1, logits.shape[2]))
+
+@torch.no_grad()
+def gen_rnd_data(X):
+    with ctx:
+        X = X * (1 + 0.1 * (0.5 - torch.rand((block_size * batch_size, 768), requires_grad=False, device=X.device)))
+        Y = model.lm_head(X)
+        X = F.tanh(X)
+        probs = F.softmax(Y, dim=1)
+        return X, probs
+
 
 @torch.no_grad()
 def collect_rnd_data():
     with ctx:
-        X = 2 * torch.rand((block_size * batch_size, 768), requires_grad=False, device=model.lm_head.weight.device) - 1
+        X = 2000 * torch.rand((block_size * batch_size, 768), requires_grad=False, device=model.lm_head.weight.device) - 1000
         Y = model.lm_head(X)
+        X = F.tanh(X)
         probs = F.softmax(Y, dim=1)
         return X, probs
 
 
 weight = model.lm_head.weight.clone().detach().requires_grad_(False)
-v2e_model = Emb2VectMLP(weight, vocab_size=50257, k=2, v_size=768, bias=True)
+# zeros = torch.zeros((47, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+# weight = torch.cat((weight, zeros))
+v2e_model = Emb2VectMLP(weight, vocab_size=50257, k=4, v_size=768, bias=False)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -134,10 +144,10 @@ weight_decay = 1e-3
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
-decay_lr = True
+# decay_lr = False
 out_dir = "out_head"
 accumulate_interval = 10
-max_iters = 10_000
+max_iters = 100_000
 t0 = time.time()
 dt = 0
 import torch
@@ -161,26 +171,38 @@ def get_lr(it):
 # optimizer
 optimizer = torch.optim.AdamW(v2e_model.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 
+X, Y = collect_data()
+X_orig = X
 while True:
-    X, Y = collect_data()
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     with ctx:
         v2e_model.calc_metrics = (iter_num % accumulate_interval == 0)
-        loss, loss2, good1, good5 = v2e_model(X, Y)
+        run_validation = (iter_num % (accumulate_interval * 5)) == 0
+        if run_validation:
+            X, Y = collect_data()
+            X_orig = X
+        else:
+            X, Y = gen_rnd_data(X_orig)
+
+        loss, good1, good5 = v2e_model(X, Y)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
     if v2e_model.calc_metrics:
-        writer.add_scalar("Loss/iter", loss, iter_num)
-        writer.add_scalar("Loss2/iter", loss2, iter_num)
-        writer.add_scalar("Top1/iter", good1, iter_num)
-        writer.add_scalar("Top5/iter", good5, iter_num)
-        print(f"iter/lr {iter_num}/{lr:3e}: loss {loss.item():3e}, loss2 {loss2.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
-    if iter_num % accumulate_interval*10 == 0:
-        writer.flush()
-        torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
+        if run_validation:
+            writer.flush()
+            torch.save(v2e_model.state_dict(), os.path.join(out_dir, 'ckpt.pt'))
+            writer.add_scalar("Val Loss", loss, iter_num)
+            writer.add_scalar("Val Top1", good1, iter_num)
+            writer.add_scalar("Val Top5", good5, iter_num)
+            print(f"Val iter/lr {iter_num}/{lr:3e}: loss {loss.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
+        else:
+            writer.add_scalar("Loss", loss, iter_num)
+            writer.add_scalar("Top1", good1, iter_num)
+            writer.add_scalar("Top5", good5, iter_num)
+            print(f"iter/lr {iter_num}/{lr:3e}: loss {loss.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
 
     # timing and logging
     t1 = time.time()

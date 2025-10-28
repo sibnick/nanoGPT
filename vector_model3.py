@@ -29,15 +29,14 @@ def cdist_matrix(a, b):
 
 class Emb2VectMLP(nn.Module):
 
-    def __init__(self, v_emb, vocab_size=50304, n_embd=768, v_size=256, bias=False, k=2, lambda_l2=0.001, C = 0.01):
+    def __init__(self, v_emb, vocab_size=50304, n_embd=768, v_size=768, bias=False, k=2, C = 0.01):
         super().__init__()
         self.vocab_size = vocab_size
-        self.lambda_l2 = lambda_l2
         self.k = k
         self.v_size = v_size
         self.n_embd = n_embd
         self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
-        self.act = nn.GELU()
+        self.act = nn.SiLU()
         # self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
         # self.act2 = nn.GELU()
         self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
@@ -50,15 +49,13 @@ class Emb2VectMLP(nn.Module):
     def forward(self, x, targets):
         x = self.c_fc(x)
         x = self.act(x)
+        # x = F.layer_norm(x, x.shape)
         # x = self.c_fc2(x)
         # x = self.act2(x)
         x = self.c_proj(x)
         # dist = cdist_matrix(x, self.v_emb)
-        # x = F.layer_norm(x, x.shape)
         dist = sim_matrix(x, self.v_emb)
-        dist = dist * dist
-        dist = dist * dist
-        dist = dist * dist
+        dist = torch.pow(dist, 8)
         #tozero = targets == 0
         #loss2 = dist.mean()
         #dist[tozero] = 0
@@ -69,7 +66,6 @@ class Emb2VectMLP(nn.Module):
             self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
         loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, reduction="mean")
         # loss = F.mse_loss(targets, dist, reduction="mean")
-        loss2 = loss
         #loss = loss + loss2
         if self.calc_metrics:
             _, correct_idx = targets.topk(k=5, largest=True, dim=1)
@@ -79,8 +75,8 @@ class Emb2VectMLP(nn.Module):
             good5 = idx[:] == correct_idx[:]
             good1 = good1.sum() / good1.shape[0]
             good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
-            return loss, loss2, good1, good5
-        return loss, loss2, None, None
+            return loss, good1, good5
+        return loss, None, None
 
     # def forward_cos(self, x, targets):
     #     targets_ = targets
