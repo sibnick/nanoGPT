@@ -9,44 +9,29 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-import os
 from dataclasses import dataclass
 
-import hnswlib
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-def sim_matrix(a, b, eps=1e-8):
-    a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
-    a_norm = a / torch.clamp(a_n, min=eps)
-    b_norm = b / torch.clamp(b_n, min=eps)
-    sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
-    return sim_mt
-
-def cdist_matrix(a, b):
-    return torch.cdist(a, b, p=2)
 
 class Emb2VectMLP(nn.Module):
 
-    def __init__(self, v_emb, vocab_size=50304, n_embd=768, v_size=768, bias=False, k=2, C = 0.01):
+    def __init__(self, v_emb, bias=False, k=2):
         super().__init__()
-        self.vocab_size = vocab_size
+        self.vocab_size = v_emb.shape[0]
+        self.n_embd = v_emb.shape[1]
         self.k = k
-        self.v_size = v_size
-        self.n_embd = n_embd
-        self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
-        self.act = nn.SiLU()
-        # self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
-        # self.act2 = nn.GELU()
-        self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
         self.v_emb = v_emb
-        self.vector_db = None
-        self.C = C
-        self.calc_metrics = False
+        self.c_fc = nn.Linear(self.n_embd, k * self.n_embd, bias=bias)
+        self.act = nn.SiLU()
+        # self.c_fc2 = nn.Linear(k*self.n_embd, k*self.n_embd, bias=bias)
+        # self.act2 = nn.GELU()
+        self.c_proj = nn.Linear(k * self.n_embd, self.n_embd, bias=bias)
         self.ones = None
 
-    def forward(self, x, targets):
+    def forward(self, x):
         x = self.c_fc(x)
         x = self.act(x)
         # x = F.layer_norm(x, x.shape)
@@ -54,73 +39,20 @@ class Emb2VectMLP(nn.Module):
         # x = self.act2(x)
         x = self.c_proj(x)
         # dist = cdist_matrix(x, self.v_emb)
-        dist = sim_matrix(x, self.v_emb)
-        dist = torch.pow(dist, 8)
-        #tozero = targets == 0
-        #loss2 = dist.mean()
-        #dist[tozero] = 0
-        #loss2 = (loss2 - dist.mean()).abs()
-        # dist = F.relu(dist.abs() - 1e-2)
+        x = self.sim_matrix(x, self.v_emb)
+        x = torch.pow(x, 2)
+        return x
 
-        if self.ones is None:
-            self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
-        loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, reduction="mean")
-        loss2 = 1 - dist.sum(dim=1).mean()
-        loss3 = 1 - self.v_emb.sum(dim=1).mean()
-        loss = loss + loss2*loss2 + loss3*loss3
-        if self.calc_metrics:
-            _, correct_idx = targets.topk(k=5, largest=True, dim=1)
-            v1, idx = dist.topk(k=5, largest=True, dim=1)
+    def sim_matrix(self, a, b, eps=1e-8):
+        a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
+        import torch
+        a_norm = a / torch.clamp(a_n, min=eps)
+        b_norm = b / torch.clamp(b_n, min=eps)
+        sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
+        return sim_mt
 
-            good1 = idx[:, 0] == correct_idx[:, 0]
-            good5 = idx[:] == correct_idx[:]
-            good1 = good1.sum() / good1.shape[0]
-            good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
-            return loss, good1, good5
-        return loss, None, None
-
-    # def forward_cos(self, x, targets):
-    #     targets_ = targets
-    #     correct_dist, correct_idx = targets_.topk(k=1, largest=False, dim=1)
-    #     x = self.c_fc(x)
-    #     x = self.act(x)
-    #     x = self.c_proj(x)
-    #     x1_normalized = F.normalize(x, p=2, dim=-1)
-    #     x2_normalized = F.normalize(self.v_emb.weight, p=2, dim=-1)
-    #     dist = torch.cdist(x1_normalized, x2_normalized, p=2)
-    #     v1, idx = dist.topk(k=5, largest=False, dim=1)
-    #     loss = F.cosine_embedding_loss(input1=targets_, input2=dist, target=torch.ones(dist.shape[0], device=x.device), reduction="none")
-    #     good1 = idx[:, 0] == correct_idx[:, 0]
-    #     good5 = idx[:] == correct_idx[:]
-    #     good1 = good1.sum() / good1.shape[0]
-    #     good5 = (good5.sum() - good1)/ good5.shape[0] / (good5.shape[1] - 1)
-    #     return loss.mean(), good1, good5
-
-    def prepare(self):
-        if os.path.exists("vector_db.bin"):
-            self.vector_db = hnswlib.Index(space='cosine', dim=self.v_emb.weight.shape[1])
-            self.vector_db.load_index("vector_db.bin")
-        else:
-            data = self.v_emb.weight.detach_().cpu().numpy()
-            num_elements, dim = data.shape
-            p = hnswlib.Index(space='cosine', dim=dim)
-            p.init_index(max_elements=num_elements, ef_construction=100, M=64)
-            p.set_ef(50)
-            p.set_num_threads(4)
-            p.add_items(data)
-            self.vector_db = p
-            self.vector_db.save_index("vector_db.bin")
-
-    def predict(self, x):
-        dev = x.device
-        x = self.c_fc(x)
-        x = self.act(x)
-        x = self.c_proj(x)
-        x = F.tanh(x)
-        x = x.view((-1, x.shape[-1])).cpu().to(dtype=torch.float32).numpy()
-        label, dist = self.vector_db.knn_query(x, k=5)
-        ans = label[0,1]
-        return torch.tensor(ans[None, None], dtype=torch.int64, device=dev)
+    def cdist_matrix(self, a, b):
+        return torch.cdist(a, b, p=2)
 
 
 class LayerNorm(nn.Module):
@@ -244,7 +176,6 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        # self.transformer.wte.weight = nn.Parameter(self.lm_head.weight.clone())
 
         # init all weights
         self.apply(self._init_weights)
@@ -276,6 +207,13 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def transform_to_vec(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.lm_head.requires_grad_(True)
+        self.vec_head = Emb2VectMLP(self.lm_head.weight).to(self.lm_head.weight.device)
+        self.ones = torch.ones(self.lm_head.weight.shape[0], device=self.lm_head.weight.device, requires_grad=False)
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -289,17 +227,29 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        if self.vec_head:
+            x = x.view((-1, x.shape[2]))
+            x = self.vec_head(x)
+            y = F.one_hot(targets.view(-1), num_classes=x.shape[1])
+            xs = x.sum(dim=1).mean()
+            xym = xs - (x * y).mean()
+            if xs - xym == xs:
+                loss = xs - xym * 1e-3 * xs/xym
+            else:
+                loss = xs - xym
+            loss2 = 1 - xs
+            return x, loss.abs() + 1e-3*loss2*loss2
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            if targets is not None:
+                # if we are given some desired targets also calculate the loss
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                # inference-time mini-optimization: only forward the lm_head on the very last position
+                logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+                loss = None
 
-        return logits, loss, x
+            return logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -412,19 +362,17 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, v2e_model, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        idx2 = torch.tensor(idx)
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, x = self(idx_cond)
-
+            logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -437,7 +385,5 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-            # todo predict base on idx2
-            idx_next2 = v2e_model.predict(x[0, -1])
-            idx2 = torch.cat((idx2, idx_next2), dim=1)
-        return idx, idx2
+
+        return idx

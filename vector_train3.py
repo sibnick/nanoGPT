@@ -124,6 +124,7 @@ def collect_rnd_data():
         return X, probs
 
 
+# weight = model.transformer.wte.weight.requires_grad_(True)
 weight = model.lm_head.weight.clone().detach().requires_grad_(False)
 # zeros = torch.zeros((47, weight.shape[1]), dtype=weight.dtype, device=weight.device)
 # weight = torch.cat((weight, zeros))
@@ -140,11 +141,11 @@ min_lr = learning_rate/100
 lr_decay_iters = 10_000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-weight_decay = 1e-3
+weight_decay = 0
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
-# decay_lr = False
+decay_lr = True
 out_dir = "out_head"
 accumulate_interval = 10
 max_iters = 100_000
@@ -180,6 +181,7 @@ while True:
     with ctx:
         v2e_model.calc_metrics = (iter_num % accumulate_interval == 0)
         run_validation = (iter_num % (accumulate_interval * 5)) == 0
+        # X, Y = collect_data()
         if run_validation:
             X, Y = collect_data()
             X_orig = X
