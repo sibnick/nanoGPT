@@ -238,7 +238,7 @@ class GPT(nn.Module):
             else:
                 loss = xs - xym
             loss2 = 1 - xs
-            return x, loss.abs() + 1e-3*loss2*loss2
+            return x, loss.abs() + loss2*loss2
         else:
             if targets is not None:
                 # if we are given some desired targets also calculate the loss
