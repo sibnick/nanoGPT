@@ -136,7 +136,7 @@ if compile:
     v2e_model = torch.compile(v2e_model) # requires PyTorch 2.0
 # training loop
 warmup_iters = 100
-learning_rate = 1e-3
+learning_rate = 1e-2
 min_lr = learning_rate/100
 lr_decay_iters = 10_000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks

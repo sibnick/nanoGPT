@@ -56,7 +56,7 @@ class Emb2VectMLP(nn.Module):
         x = self.c_proj(x)
         # dist = cdist_matrix(x, self.v_emb)
         dist = sim_matrix(x, self.v_emb)
-        dist = torch.clamp(dist, max=1) + self.bias.abs()
+        dist = torch.clamp(dist, min=0) + self.bias.abs()
         #tozero = targets == 0
         #loss2 = dist.mean()
         #dist[tozero] = 0
