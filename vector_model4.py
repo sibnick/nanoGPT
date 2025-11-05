@@ -16,32 +16,35 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    k: int = 4
+
 class Emb2VectMLP(nn.Module):
 
-    def __init__(self, v_emb, bias=False, k=2):
+    def __init__(self, config):
         super().__init__()
-        self.vocab_size = v_emb.shape[0]
-        self.n_embd = v_emb.shape[1]
-        self.k = k
-        self.v_emb = v_emb
-        self.c_fc = nn.Linear(self.n_embd, k * self.n_embd, bias=bias)
-        self.act = nn.SiLU()
-        # self.c_fc2 = nn.Linear(k*self.n_embd, k*self.n_embd, bias=bias)
-        # self.act2 = nn.GELU()
-        self.c_proj = nn.Linear(k * self.n_embd, self.n_embd, bias=bias)
+        config = GPTConfig(vocab_size=config.vocab_size, n_embd=config.n_embd, bias=False, k=2)
+        self.transform = MLP(config)
+        self.v_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.ones = None
+        #self.min = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.act(x)
-        # x = F.layer_norm(x, x.shape)
-        # x = self.c_fc2(x)
-        # x = self.act2(x)
-        x = self.c_proj(x)
-        # dist = cdist_matrix(x, self.v_emb)
-        x = self.sim_matrix(x, self.v_emb)
-        x = torch.pow(x, 2)
-        return x
+        x = self.transform(x)
+        orig_x = self.sim_matrix(x, self.v_emb.weight)
+        x = torch.clamp(orig_x, min=0)
+        #m = torch.clamp(self.min, max=0.05)
+        #x = torch.clamp(orig_x, m)
+        #x = (x - m) * (1 + m)
+        return x, orig_x
 
     def sim_matrix(self, a, b, eps=1e-8):
         a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
@@ -119,9 +122,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, config.k * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(config.k * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -144,16 +147,6 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
 
@@ -210,9 +203,8 @@ class GPT(nn.Module):
     def transform_to_vec(self):
         for p in self.parameters():
             p.requires_grad_(False)
-        self.lm_head.requires_grad_(True)
-        self.vec_head = Emb2VectMLP(self.lm_head.weight).to(self.lm_head.weight.device)
-        self.ones = torch.ones(self.lm_head.weight.shape[0], device=self.lm_head.weight.device, requires_grad=False)
+        self.vec_head = Emb2VectMLP(self.config).to(self.lm_head.weight.device)
+        self.ones = None
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -228,17 +220,24 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         if self.vec_head:
-            x = x.view((-1, x.shape[2]))
-            x = self.vec_head(x)
-            y = F.one_hot(targets.view(-1), num_classes=x.shape[1])
-            xs = x.sum(dim=1).mean()
-            xym = xs - (x * y).mean()
-            if xs - xym == xs:
-                loss = xs - xym * 1e-3 * xs/xym
+            loss = None
+            if targets is not None:
+                vec_x = x.view((-1, x.shape[2]))
+                vec_x, vec_x_orig = self.vec_head(vec_x)
+                logits = self.lm_head(x)
+                y = F.softmax(logits.view(-1, logits.shape[2]), dim=-1)
+                #y = F.one_hot(targets.view(-1), num_classes=x.shape[1]).to(dtype=x.dtype, device=x.device)
+                # xs = 1 - x.sum(dim=1).mean()
+                # xs = xs * xs
+                # loss2 = xs.mean()
+                if self.ones is None:
+                    self.ones = torch.ones(y.shape[0], device=self.lm_head.weight.device, requires_grad=False)
+                loss = F.cosine_embedding_loss(vec_x, y, self.ones)
             else:
-                loss = xs - xym
-            loss2 = 1 - xs
-            return x, loss.abs() + loss2*loss2
+                x = x[:, [-1], :]
+                x = x.view((-1, x.shape[2]))
+                x, x_orig = self.vec_head(x)
+            return x, loss
         else:
             if targets is not None:
                 # if we are given some desired targets also calculate the loss
@@ -330,7 +329,7 @@ class GPT(nn.Module):
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': nodecay_params, 'weight_decay': 100*weight_decay}
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -373,6 +372,7 @@ class GPT(nn.Module):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
+            logits = logits[None, :]
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

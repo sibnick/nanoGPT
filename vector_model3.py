@@ -29,7 +29,7 @@ def cdist_matrix(a, b):
 
 class Emb2VectMLP(nn.Module):
 
-    def __init__(self, v_emb, vocab_size=50304, n_embd=768, v_size=768, bias=False, k=2, C = 0.01):
+    def __init__(self, v_emb, vocab_size=50304, n_embd=768, v_size=768, bias=False, k=4, C = 0.01):
         super().__init__()
         self.vocab_size = vocab_size
         self.k = k
@@ -37,6 +37,7 @@ class Emb2VectMLP(nn.Module):
         self.n_embd = n_embd
         self.c_fc = nn.Linear(n_embd, k*n_embd, bias=bias)
         self.act = nn.SiLU()
+        self.bias = nn.Parameter(torch.zeros((vocab_size)))
         # self.c_fc2 = nn.Linear(k*n_embd, k*n_embd, bias=bias)
         # self.act2 = nn.GELU()
         self.c_proj = nn.Linear(k*n_embd, v_size, bias=bias)
@@ -55,7 +56,7 @@ class Emb2VectMLP(nn.Module):
         x = self.c_proj(x)
         # dist = cdist_matrix(x, self.v_emb)
         dist = sim_matrix(x, self.v_emb)
-        dist = torch.pow(dist, 8)
+        dist = torch.clamp(dist, max=1) + self.bias.abs()
         #tozero = targets == 0
         #loss2 = dist.mean()
         #dist[tozero] = 0
@@ -65,9 +66,9 @@ class Emb2VectMLP(nn.Module):
         if self.ones is None:
             self.ones = torch.ones(dist.shape[0], device=x.device, requires_grad=False)
         loss = F.cosine_embedding_loss(input1=targets, input2=dist, target=self.ones, reduction="mean")
-        loss2 = 1 - dist.sum(dim=1).mean()
-        loss3 = 1 - self.v_emb.sum(dim=1).mean()
-        loss = loss + loss2*loss2 + loss3*loss3
+        # loss2 = 1 - dist.sum(dim=1).mean()
+        # loss3 = 1 - self.v_emb.sum(dim=1).mean()
+        # loss = loss + loss2*loss2 + loss3*loss3
         if self.calc_metrics:
             _, correct_idx = targets.topk(k=5, largest=True, dim=1)
             v1, idx = dist.topk(k=5, largest=True, dim=1)

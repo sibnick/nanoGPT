@@ -99,7 +99,7 @@ def collect_data():
         logits = logits.view((-1, logits.shape[2]))
         probs = F.softmax(logits, dim=1)
         x = x.view((-1, x.shape[2]))
-        x = F.tanh(x)
+        # x = F.tanh(x)
         # zeros = torch.zeros((x.shape[0], 47), dtype=x.dtype, device=x.device)
         # probs = torch.cat((probs, zeros), dim=1)
         return x, probs
@@ -109,7 +109,7 @@ def gen_rnd_data(X):
     with ctx:
         X = X * (1 + 0.1 * (0.5 - torch.rand((block_size * batch_size, 768), requires_grad=False, device=X.device)))
         Y = model.lm_head(X)
-        X = F.tanh(X)
+        # X = F.tanh(X)
         probs = F.softmax(Y, dim=1)
         return X, probs
 
@@ -128,7 +128,7 @@ def collect_rnd_data():
 weight = model.lm_head.weight.clone().detach().requires_grad_(False)
 # zeros = torch.zeros((47, weight.shape[1]), dtype=weight.dtype, device=weight.device)
 # weight = torch.cat((weight, zeros))
-v2e_model = Emb2VectMLP(weight, vocab_size=50257, k=4, v_size=768, bias=False)
+v2e_model = Emb2VectMLP(weight, vocab_size=50257, k=8, v_size=768, bias=False)
 v2e_model.to(device)
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -141,14 +141,14 @@ min_lr = learning_rate/100
 lr_decay_iters = 10_000
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-weight_decay = 0
+weight_decay = 1e-3
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
 decay_lr = True
 out_dir = "out_head"
 accumulate_interval = 10
-max_iters = 100_000
+max_iters = 10_000
 t0 = time.time()
 dt = 0
 import torch
@@ -180,7 +180,7 @@ while True:
         param_group['lr'] = lr
     with ctx:
         v2e_model.calc_metrics = (iter_num % accumulate_interval == 0)
-        run_validation = (iter_num % (accumulate_interval * 5)) == 0
+        run_validation = False #(iter_num % (accumulate_interval * 5)) == 0
         # X, Y = collect_data()
         if run_validation:
             X, Y = collect_data()
@@ -201,6 +201,7 @@ while True:
             writer.add_scalar("Val Top5", good5, iter_num)
             print(f"Val iter/lr {iter_num}/{lr:3e}: loss {loss.item():3e}, good1 {good1:.4f}, good5 {good5:.4f}, time {dt * 1000:.2f}ms ")
         else:
+            writer.add_scalar("Lr", lr, iter_num)
             writer.add_scalar("Loss", loss, iter_num)
             writer.add_scalar("Top1", good1, iter_num)
             writer.add_scalar("Top5", good5, iter_num)

@@ -57,7 +57,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
+weight_decay = 1e-3
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
@@ -175,7 +175,7 @@ elif init_from == 'resume':
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
@@ -191,7 +191,7 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
-
+model.transform_to_vec()
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -256,12 +256,16 @@ running_mfu = -1.0
 import torch
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter(comment=f"Params")
-model.transform_to_vec()
 
 while True:
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    if decay_lr :
+        lr = get_lr(iter_num)
+        writer.add_scalar("lr", lr, iter_num)
+    else:
+        lr = learning_rate
+
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -311,6 +315,9 @@ while True:
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
+        writer.add_scalar("train/loss", loss, iter_num)
+        # writer.add_scalar("min param", model.vec_head.min, iter_num)
+
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -336,6 +343,8 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
+    # if iter_num == 100:
+    #     model.vec_head.min.requires_grad_(True)
     local_iter_num += 1
 
     # termination conditions
