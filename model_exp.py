@@ -122,7 +122,8 @@ class CmpBlock(nn.Module):
         
         # 4. Attention on compressed sequence then expand back
         attn_out = self.attn(mid)
-        attn_out_expanded = self.compress.expand(attn_out)
+        # Expand and crop to original length T
+        attn_out_expanded = self.compress.expand(attn_out)[:, :x.shape[1], :]
         
         # 5. Residual connection
         x = x + attn_out_expanded
@@ -172,15 +173,15 @@ class GPT(nn.Module):
             h = nn.ModuleList([CmpBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
+        self.lm_head = nn.Linear(config.n_embd, config.compression_factor * config.n_embd, bias=False)
+        # Weight tying is removed because head and embedding shapes no longer match
+        
         # init all weights
         self.apply(self._init_weights)
+        
+        # Initial normalization of weights
+        with torch.no_grad():
+            self.transformer.wte.weight.copy_(F.normalize(self.transformer.wte.weight, p=2, dim=-1))
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
@@ -217,6 +218,8 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        tok_emb = F.normalize(tok_emb, p=2, dim=-1) # normalize token embeddings to unit norm
+        
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         
@@ -226,18 +229,42 @@ class GPT(nn.Module):
             recon_losses.append(block.recon_loss)
             
         x = self.transformer.ln_f(x)
+        x = F.normalize(x, p=2, dim=-1) # normalize output vectors to unit norm
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Multi-token prediction: predict 16 tokens at each step
+            # x shape: (B, T, C)
+            # Project to blocks: (B, T, 16, C)
+            pred_vectors = self.lm_head(x).view(b, t, self.config.compression_factor, -1)
+            pred_vectors = F.normalize(pred_vectors, p=2, dim=-1)
+            
+            # targets shape: (B, T, 16)
+            # Get target embeddings and normalize them: (B, T, 16, C)
+            with torch.no_grad():
+                target_emb = self.transformer.wte(targets)
+                target_emb = F.normalize(target_emb, p=2, dim=-1)
+            
+            # Loss is MSE between predicted vectors and target embeddings
+            mtp_loss = F.mse_loss(pred_vectors, target_emb)
+            
             # Add mean reconstruction loss from all blocks
             mean_recon_loss = torch.stack(recon_losses).mean()
-            loss = loss + mean_recon_loss
+            loss = mtp_loss + mean_recon_loss
+            logits = None 
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # inference-time: compute similarity for ALL 16 predicted tokens in the block
+            w = F.normalize(self.transformer.wte.weight, p=2, dim=-1)
+            
+            # Predict tokens: (B, 1, 16, C)
+            pred_blocks = self.lm_head(x[:, [-1], :]).view(b, 1, self.config.compression_factor, -1)
+            pred_blocks = F.normalize(pred_blocks, p=2, dim=-1)
+            
+            # Similarity for all tokens in the block: (B, 1, 16, V)
+            similarity = torch.matmul(pred_blocks, w.t()) 
+            logits = similarity
             loss = None
+
+        return logits, loss
 
         return logits, loss
 
@@ -355,25 +382,41 @@ class GPT(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        the sequence max_new_tokens times, using all 16 tokens from each model prediction.
         """
-        for _ in range(max_new_tokens):
+        num_generated = 0
+        while num_generated < max_new_tokens:
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+            
+            # forward the model to get the similarities for the entire block
+            # logits shape: (B, 1, 16, V)
+            similarity, _ = self(idx_cond)
+            
+            # Calculate negative squared L2 distance as logits
+            # d^2 = ||p - w||^2 = ||p||^2 + ||w||^2 - 2*<p, w> = 1 + 1 - 2*sim = 2 - 2*sim
+            dist_sq = 2.0 - 2.0 * similarity
+            logits = -dist_sq / temperature # (B, 1, 16, V)
+            
+            B, _, K, V = logits.size()
+            logits = logits.view(B * K, V) # Flatten for sampling efficiency
+            
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                v, _ = torch.topk(logits, min(top_k, V))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+                
+            # apply softmax and sample
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx_block_flat = torch.multinomial(probs, num_samples=1) # (B*K, 1)
+            idx_block = idx_block_flat.view(B, K) # (B, 16)
+            
+            # Cap if we only need a few more tokens
+            tokens_to_take = min(K, max_new_tokens - num_generated)
+            idx_block = idx_block[:, :tokens_to_take]
+            
+            # append and update
+            idx = torch.cat((idx, idx_block), dim=1)
+            num_generated += tokens_to_take
 
         return idx

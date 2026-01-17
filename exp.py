@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 import math
 
 class CompressedModule(nn.Module):
@@ -44,12 +45,20 @@ class CompressedModule(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        if T % self.block_size != 0:
-            raise ValueError(f"Sequence length T ({T}) must be divisible by block_size ({self.block_size})")
         if T > self.max_T:
             raise ValueError(f"Sequence length T ({T}) exceeds max_T ({self.max_T})")
+        
+        # Handle non-divisible lengths by padding
+        padding = 0
+        if T % self.block_size != 0:
+            padding = self.block_size - (T % self.block_size)
+            x = F.pad(x, (0, 0, 0, padding))
             
         mid = self.compress(x)
         restored = self.expand(mid)
+        
+        # Crop back if we padded
+        if padding > 0:
+            restored = restored[:, :T, :]
         
         return mid, restored
