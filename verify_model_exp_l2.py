@@ -17,7 +17,8 @@ def test_l2_model():
     
     B, T = 1, 8
     idx = torch.randint(0, config.vocab_size, (B, T))
-    targets = torch.randint(0, config.vocab_size, (B, T))
+    # targets shape for multi-token prediction should be (B, T, compression_factor)
+    targets = torch.randint(0, config.vocab_size, (B, T, config.compression_factor))
     
     # Check weight normalization in init
     w_init_norm = model.transformer.wte.weight.norm(p=2, dim=-1)

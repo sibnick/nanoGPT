@@ -11,10 +11,10 @@ from model_exp import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out-shakespeare-char-cmp16' # ignored if init_from is not 'resume'
-start = "Hallo! My name is" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+start = "Hello! My name is " # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 2#0 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 1#0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
+temperature = 0.1#0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.

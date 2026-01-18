@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from exp import CompressedModule
+from mhc_fast import fast_sinkhorn
 
 
 class LayerNorm(nn.Module):
@@ -108,6 +109,10 @@ class CmpBlock(nn.Module):
         print(f"Compression factor: {self.compression_factor}")
         self.compress = CompressedModule(block_size=self.compression_factor, max_T=config.block_size)
         self.recon_loss = 0.0
+        
+        # MHC parameters
+        self.H_res_raw_attn = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
+        self.H_res_raw_mlp = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
 
     def forward(self, x):
         # 1. Apply LayerNorm
@@ -125,13 +130,13 @@ class CmpBlock(nn.Module):
         # Expand and crop to original length T
         attn_out_expanded = self.compress.expand(attn_out)[:, :x.shape[1], :]
         
-        # 5. Residual connection
-        x = x + attn_out_expanded
+        # 5. Residual connection (MHC)
+        H_res_attn = fast_sinkhorn(self.H_res_raw_attn)
+        x = torch.einsum('ij, btj -> bti', H_res_attn, x) + attn_out_expanded
         
-        # 6. MLP (still on full sequence length, or as per requirement? 
-        # The request said "run CausalSelfAttention not over original x but on compressed version", 
-        # usually residual stream is full length.)
-        x = x + self.mlp(self.ln_2(x))
+        # 6. MLP (still on full sequence length)
+        H_res_mlp = fast_sinkhorn(self.H_res_raw_mlp)
+        x = torch.einsum('ij, btj -> bti', H_res_mlp, x) + self.mlp(self.ln_2(x))
         return x
 
 class Block(nn.Module):
@@ -142,10 +147,17 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        
+        # MHC parameters
+        self.H_res_raw_attn = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
+        self.H_res_raw_mlp = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        H_res_attn = fast_sinkhorn(self.H_res_raw_attn)
+        x = torch.einsum('ij, btj -> bti', H_res_attn, x) + self.attn(self.ln_1(x))
+        
+        H_res_mlp = fast_sinkhorn(self.H_res_raw_mlp)
+        x = torch.einsum('ij, btj -> bti', H_res_mlp, x) + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -168,7 +180,7 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            #wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([CmpBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -198,8 +210,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        #if non_embedding:
+        #    _params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -210,18 +222,23 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def get_normalized_wte(self):
+        """Returns the token embedding weight matrix with L2-normalized rows (L2=1)."""
+        return F.normalize(self.transformer.wte.weight, p=2, dim=-1)
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        #pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        tok_emb = F.normalize(tok_emb, p=2, dim=-1) # normalize token embeddings to unit norm
+        # Use normalized embeddings: L2 norm of each token vector is 1
+        wte_normalized = self.get_normalized_wte()
+        tok_emb = F.embedding(idx, wte_normalized)
         
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb)# + pos_emb)
         
         recon_losses = []
         for block in self.transformer.h:
@@ -241,19 +258,31 @@ class GPT(nn.Module):
             # targets shape: (B, T, 16)
             # Get target embeddings and normalize them: (B, T, 16, C)
             with torch.no_grad():
-                target_emb = self.transformer.wte(targets)
-                target_emb = F.normalize(target_emb, p=2, dim=-1)
+                target_emb = F.embedding(targets, wte_normalized)
+                # target_emb is already normalized because it's looked up from wte_normalized
             
             # Loss is MSE between predicted vectors and target embeddings
             mtp_loss = F.mse_loss(pred_vectors, target_emb)
             
             # Add mean reconstruction loss from all blocks
             mean_recon_loss = torch.stack(recon_losses).mean()
-            loss = mtp_loss + mean_recon_loss
+            
+            # Add embedding dispersion loss to prevent collapse
+            # W shape: (V, C), normalized
+            # W @ W.T is the cosine similarity matrix (V, V)
+            # We want off-diagonal elements to be close to 0
+            w = wte_normalized
+            sim_matrix = torch.matmul(w, w.t())
+            identity = torch.eye(self.config.vocab_size, device=device)
+            dispersion_loss = ((sim_matrix - identity) ** 2).mean()
+            
+            # Total loss: MTP + Reconstruction + Dispersion
+            # Using 0.1 as a coefficient for dispersion as planned
+            loss = mtp_loss + mean_recon_loss + 0.1 * dispersion_loss
             logits = None 
         else:
             # inference-time: compute similarity for ALL 16 predicted tokens in the block
-            w = F.normalize(self.transformer.wte.weight, p=2, dim=-1)
+            w = self.get_normalized_wte()
             
             # Predict tokens: (B, 1, 16, C)
             pred_blocks = self.lm_head(x[:, [-1], :]).view(b, 1, self.config.compression_factor, -1)
@@ -266,15 +295,13 @@ class GPT(nn.Module):
 
         return logits, loss
 
-        return logits, loss
-
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        #self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
