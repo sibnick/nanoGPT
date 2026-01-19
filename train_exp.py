@@ -70,6 +70,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+compression_factor = 16 # number of tokens to predict at each step
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -96,7 +97,7 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size * (compression_factor if compression_factor else 1)
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
@@ -118,16 +119,22 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size - 15, (batch_size,))
+    # Determine the slice size for y
+    y_slice_size = compression_factor if compression_factor else 1
+    
+    ix = torch.randint(len(data) - block_size - (y_slice_size - 1), (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     
-    # y[b, t] should be the block of 16 tokens starting at t+1
-    # For each i in ix, we take tokens from i+1 to i+block_size+15
-    y_full = torch.stack([torch.from_numpy((data[i+1:i+block_size+16]).astype(np.int64)) for i in ix])
-    # Now use unfold to get sliding windows of size 16
-    # y_full shape: (batch_size, block_size + 15)
-    # Resulting shape: (batch_size, block_size, 16)
-    y = y_full.unfold(1, 16, 1)
+    # y[b, t] should be the next token(s) starting at t+1
+    y_full = torch.stack([torch.from_numpy((data[i+1:i+block_size+y_slice_size]).astype(np.int64)) for i in ix])
+    
+    if y_slice_size == 1:
+        y = y_full
+    else:
+        # Now use unfold to get sliding windows of size y_slice_size
+        # y_full shape: (batch_size, block_size + y_slice_size - 1)
+        # Resulting shape: (batch_size, block_size, y_slice_size)
+        y = y_full.unfold(1, y_slice_size, 1)
     
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -235,7 +242,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, _ = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -311,7 +318,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, recon_loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -335,10 +342,11 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        recon_lossf = recon_loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, recon_loss {recon_lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 

@@ -27,6 +27,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+from model import GPTConfig, GPT
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -118,17 +120,9 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size - 15, (batch_size,))
+    ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    
-    # y[b, t] should be the block of 16 tokens starting at t+1
-    # For each i in ix, we take tokens from i+1 to i+block_size+15
-    y_full = torch.stack([torch.from_numpy((data[i+1:i+block_size+16]).astype(np.int64)) for i in ix])
-    # Now use unfold to get sliding windows of size 16
-    # y_full shape: (batch_size, block_size + 15)
-    # Resulting shape: (batch_size, block_size, 16)
-    y = y_full.unfold(1, 16, 1)
-    
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -150,12 +144,6 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-if compression_factor:
-    from model_exp import GPT, GPTConfig
-    model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, compression_factor=compression_factor,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-else:
-    from model import GPT, GPTConfig
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, 
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 

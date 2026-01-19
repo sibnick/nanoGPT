@@ -15,15 +15,20 @@ class CompressedModule(nn.Module):
       weighted sum of all input tokens from index 0 to (i+1)*16 - 1.
     - Output tokens in index range [16*i, 16*(i+1)) only use the i-th compressed token.
     """
-    def __init__(self, block_size=16, max_T=1024):
+    def __init__(self, n_embd, block_size=16, max_T=1024):
         super().__init__()
         self.block_size = block_size
+        self.n_embd = n_embd
         self.max_T = max_T
         num_mid = max_T // block_size
         
         # Learnable weights for temporal compression: (num_mid, max_T)
         # Each 'mid' token is a linear combination of input tokens
         self.weight = nn.Parameter(torch.randn(num_mid, max_T) / math.sqrt(block_size))
+        
+        # Learnable projection for expansion: maps 1 compressed token to block_size tokens
+        self.expand_proj = nn.Linear(n_embd, block_size * n_embd, bias=False)
+        self.expand_proj_final = nn.Linear(n_embd, block_size * n_embd, bias=False)
         
         # Causal mask for cumulative property
         # mask[i, t] = 1 if input token t affects middle token i
@@ -39,9 +44,23 @@ class CompressedModule(nn.Module):
         w = self.weight[:num_mid, :T] * self.mask[:num_mid, :T]
         mid = torch.einsum('mt, btc -> bmc', w, x)
         return mid
+        
 
     def expand(self, mid):
-        return mid.repeat_interleave(self.block_size, dim=1)
+        B, M, C = mid.shape
+        # Project each compressed token to block_size * C
+        expanded = self.expand_proj(mid) # (B, M, block_size * C)
+        # Reshape to (B, M * block_size, C)
+        expanded = expanded.view(B, M * self.block_size, C)
+        return expanded
+
+    def expand_final(self, mid):
+        B, M, C = mid.shape
+        # Project each compressed token to block_size * C
+        expanded = self.expand_proj_final(mid) # (B, M, block_size * C)
+        # Reshape to (B, M * block_size, C)
+        expanded = expanded.view(B, M * self.block_size, C)
+        return expanded
 
     def forward(self, x):
         B, T, C = x.shape
@@ -60,5 +79,5 @@ class CompressedModule(nn.Module):
         # Crop back if we padded
         if padding > 0:
             restored = restored[:, :T, :]
-        
+            
         return mid, restored

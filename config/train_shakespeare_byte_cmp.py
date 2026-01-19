@@ -1,7 +1,7 @@
-# train a miniature character-level shakespeare model
+# train a miniature byte-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-shakespeare-char-cmp16'
+out_dir = 'out-shakespeare-byte-cmp16'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -10,10 +10,10 @@ log_interval = 10 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
-wandb_project = 'shakespeare-char'
+wandb_project = 'shakespeare-byte'
 wandb_run_name = 'mini-gpt'
 
-dataset = 'shakespeare_char'
+dataset = 'shakespeare_bytes'
 gradient_accumulation_steps = 1
 batch_size = 512
 block_size = 256 # context of up to 256 previous characters
@@ -21,10 +21,10 @@ block_size = 256 # context of up to 256 previous characters
 # baby GPT model :)
 n_layer = 6
 n_head = 8
-n_embd = 128
-dropout = 0.2
+n_embd = 256
+dropout = 0.1
 
-compression_factor = 16
+compression_factor = 4
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
 max_iters = 5000

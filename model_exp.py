@@ -107,38 +107,37 @@ class CmpBlock(nn.Module):
         # Compression factor
         self.compression_factor = getattr(config, 'compression_factor', 16)
         print(f"Compression factor: {self.compression_factor}")
-        self.compress = CompressedModule(block_size=self.compression_factor, max_T=config.block_size)
+        self.compress = CompressedModule(config.n_embd, block_size=self.compression_factor, max_T=config.block_size)
         self.recon_loss = 0.0
         
         # MHC parameters
-        self.H_res_raw_attn = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
-        self.H_res_raw_mlp = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
+        #self.H_res_raw_attn = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
+        #self.H_res_raw_mlp = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
 
     def forward(self, x):
         # 1. Apply LayerNorm
         x_norm = self.ln_1(x)
         
-        # 2. Compress for attention
-        # mid shape: (B, T/16, C), restored shape: (B, T, C)
+        # 2. Compress
+        # mid shape: (B, T/compression_factor, C), restored shape: (B, T, C)
         mid, restored = self.compress(x_norm)
         
         # 3. Calculate reconstruction loss (MSE between norm input and restored)
         self.recon_loss = F.mse_loss(restored, x_norm)
         
-        # 4. Attention on compressed sequence then expand back
-        attn_out = self.attn(mid)
-        # Expand and crop to original length T
-        attn_out_expanded = self.compress.expand(attn_out)[:, :x.shape[1], :]
+        # 4. Attention on compressed sequence
+        mid = mid + self.attn(mid)
         
-        # 5. Residual connection (MHC)
-        H_res_attn = fast_sinkhorn(self.H_res_raw_attn)
-        x = torch.einsum('ij, btj -> bti', H_res_attn, x) + attn_out_expanded
+        # 5. MLP on compressed sequence
+        mid = mid + self.mlp(self.ln_2(mid))
         
-        # 6. MLP (still on full sequence length)
-        H_res_mlp = fast_sinkhorn(self.H_res_raw_mlp)
-        x = torch.einsum('ij, btj -> bti', H_res_mlp, x) + self.mlp(self.ln_2(x))
+        # 6. Expand back to original sequence length T and add to residual
+        out_expanded = self.compress.expand_final(mid)[:, :x.shape[1], :]
+        x = x + out_expanded
+        
         return x
 
+"""
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -159,6 +158,10 @@ class Block(nn.Module):
         H_res_mlp = fast_sinkhorn(self.H_res_raw_mlp)
         x = torch.einsum('ij, btj -> bti', H_res_mlp, x) + self.mlp(self.ln_2(x))
         return x
+        #x = x + self.attn(self.ln_1(x))
+        #x = x + self.mlp(self.ln_2(x))
+        #return x
+"""
 
 @dataclass
 class GPTConfig:
@@ -185,7 +188,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([CmpBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.compression_factor * config.n_embd, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.compression_factor * config.vocab_size, bias=False)
         # Weight tying is removed because head and embedding shapes no longer match
         
         # init all weights
@@ -211,7 +214,7 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         #if non_embedding:
-        #    _params -= self.transformer.wpe.weight.numel()
+        #    n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -230,39 +233,33 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        #pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         # Use normalized embeddings: L2 norm of each token vector is 1
-        wte_normalized = self.get_normalized_wte()
-        tok_emb = F.embedding(idx, wte_normalized)
+        #wte_normalized = self.get_normalized_wte()
+        #tok_emb = F.embedding(idx, wte_normalized)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         
         #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb)# + pos_emb)
-        
+        x = self.transformer.drop(tok_emb) # + pos_emb)
         recon_losses = []
         for block in self.transformer.h:
             x = block(x)
             recon_losses.append(block.recon_loss)
             
         x = self.transformer.ln_f(x)
-        x = F.normalize(x, p=2, dim=-1) # normalize output vectors to unit norm
+        #x = F.normalize(x, p=2, dim=-1) # normalize output vectors to unit norm
 
         if targets is not None:
             # Multi-token prediction: predict 16 tokens at each step
             # x shape: (B, T, C)
-            # Project to blocks: (B, T, 16, C)
-            pred_vectors = self.lm_head(x).view(b, t, self.config.compression_factor, -1)
-            pred_vectors = F.normalize(pred_vectors, p=2, dim=-1)
+            # Project to blocks: (B, T, 16, V)
+            logits = self.lm_head(x).view(b, t, self.config.compression_factor, self.config.vocab_size)
             
+            # Loss is cross-entropy between predicted logits and target indices
             # targets shape: (B, T, 16)
-            # Get target embeddings and normalize them: (B, T, 16, C)
-            with torch.no_grad():
-                target_emb = F.embedding(targets, wte_normalized)
-                # target_emb is already normalized because it's looked up from wte_normalized
-            
-            # Loss is MSE between predicted vectors and target embeddings
-            mtp_loss = F.mse_loss(pred_vectors, target_emb)
+            mtp_loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1))
             
             # Add mean reconstruction loss from all blocks
             mean_recon_loss = torch.stack(recon_losses).mean()
@@ -271,29 +268,24 @@ class GPT(nn.Module):
             # W shape: (V, C), normalized
             # W @ W.T is the cosine similarity matrix (V, V)
             # We want off-diagonal elements to be close to 0
-            w = wte_normalized
-            sim_matrix = torch.matmul(w, w.t())
-            identity = torch.eye(self.config.vocab_size, device=device)
-            dispersion_loss = ((sim_matrix - identity) ** 2).mean()
+            #w = wte_normalized
+            #sim_matrix = torch.matmul(w, w.t())
+            #identity = torch.eye(self.config.vocab_size, device=device)
+            #dispersion_loss = ((sim_matrix - identity) ** 2).mean()
             
             # Total loss: MTP + Reconstruction + Dispersion
             # Using 0.1 as a coefficient for dispersion as planned
-            loss = mtp_loss + mean_recon_loss + 0.1 * dispersion_loss
+            #print("MTP loss: ", mtp_loss.item(), " Reconstruction loss: ", mean_recon_loss.item(), " Dispersion loss: ", dispersion_loss.item())
+            loss = mtp_loss + 0.1 * mean_recon_loss# + 0.1 * dispersion_loss
             logits = None 
         else:
-            # inference-time: compute similarity for ALL 16 predicted tokens in the block
-            w = self.get_normalized_wte()
-            
-            # Predict tokens: (B, 1, 16, C)
-            pred_blocks = self.lm_head(x[:, [-1], :]).view(b, 1, self.config.compression_factor, -1)
-            pred_blocks = F.normalize(pred_blocks, p=2, dim=-1)
-            
-            # Similarity for all tokens in the block: (B, 1, 16, V)
-            similarity = torch.matmul(pred_blocks, w.t()) 
-            logits = similarity
+            # inference-time: compute logits for ALL 16 predicted tokens in the block
+            # Predict tokens: (B, 1, 16, V)
+            logits = self.lm_head(x[:, [-1], :]).view(b, 1, self.config.compression_factor, self.config.vocab_size)
             loss = None
+            mean_recon_loss = None
 
-        return logits, loss
+        return logits, loss, mean_recon_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -416,14 +408,10 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             
-            # forward the model to get the similarities for the entire block
+            # forward the model to get the logits for the entire block
             # logits shape: (B, 1, 16, V)
-            similarity, _ = self(idx_cond)
-            
-            # Calculate negative squared L2 distance as logits
-            # d^2 = ||p - w||^2 = ||p||^2 + ||w||^2 - 2*<p, w> = 1 + 1 - 2*sim = 2 - 2*sim
-            dist_sq = 2.0 - 2.0 * similarity
-            logits = -dist_sq / temperature # (B, 1, 16, V)
+            logits, _, _ = self(idx_cond)
+            logits = logits / temperature # (B, 1, 16, V)
             
             B, _, K, V = logits.size()
             logits = logits.view(B * K, V) # Flatten for sampling efficiency
@@ -439,7 +427,8 @@ class GPT(nn.Module):
             idx_block = idx_block_flat.view(B, K) # (B, 16)
             
             # Cap if we only need a few more tokens
-            tokens_to_take = min(K, max_new_tokens - num_generated)
+            #tokens_to_take = min(K, max_new_tokens - num_generated)
+            tokens_to_take = 1
             idx_block = idx_block[:, :tokens_to_take]
             
             # append and update
