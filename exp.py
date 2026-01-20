@@ -5,79 +5,84 @@ import math
 
 class CompressedModule(nn.Module):
     """
-    A module that compresses the sequence length by a factor of 16 using a learnable linear transformation.
+    A module that compresses the sequence length by a factor of block_size (default 16) 
+    using per-head learnable transformations on local blocks.
+    
     Input shape: (B, T, C)
-    Middle compressed layer shape: (B, T/16, C)
+    Internal shape: (B, n_head, T/block_size, head_dim)
     Output shape: (B, T, C)
     
-    Causality:
-    - The i-th compressed token at index i (representing a block of 16) is a learnable
-      weighted sum of all input tokens from index 0 to (i+1)*16 - 1.
-    - Output tokens in index range [16*i, 16*(i+1)) only use the i-th compressed token.
+    Constraint: T must be divisible by block_size.
     """
-    def __init__(self, n_embd, block_size=16, max_T=1024):
+    def __init__(self, n_embd, n_head, block_size=16):
         super().__init__()
-        self.block_size = block_size
+        assert n_embd % n_head == 0
         self.n_embd = n_embd
-        self.max_T = max_T
-        num_mid = max_T // block_size
+        self.n_head = n_head
+        self.block_size = block_size
+        self.head_dim = n_embd // n_head
         
-        # Learnable weights for temporal compression: (num_mid, max_T)
-        # Each 'mid' token is a linear combination of input tokens
-        self.weight = nn.Parameter(torch.randn(num_mid, max_T) / math.sqrt(block_size))
+        # Per-head learnable weights for temporal compression: (n_head, block_size)
+        # Each head learns its own weighted sum of the local block (like a CNN kernel).
+        self.weight = nn.Parameter(torch.randn(n_head, block_size) / math.sqrt(block_size))
         
-        # Learnable projection for expansion: maps 1 compressed token to block_size tokens
-        self.expand_proj = nn.Linear(n_embd, block_size * n_embd, bias=False)
-        self.expand_proj_final = nn.Linear(n_embd, block_size * n_embd, bias=False)
-        
-        # Causal mask for cumulative property
-        # mask[i, t] = 1 if input token t affects middle token i
-        # Middle token i represents block i, which depends on tokens 0 to (i+1)*block_size-1
-        mask = torch.zeros(num_mid, max_T)
-        for i in range(num_mid):
-            mask[i, : (i + 1) * block_size] = 1.0
-        self.register_buffer("mask", mask)
+        # Per-head learnable projections for expansion.
+        # Maps 1 compressed head vector to (block_size * head_dim) values.
+        # Shape: (n_head, head_dim, block_size * head_dim)
+        self.expand_proj       = nn.Parameter(torch.randn(n_head, self.head_dim, block_size * self.head_dim) / math.sqrt(self.head_dim))
+        #self.expand_proj_final = nn.Parameter(torch.randn(n_head, self.head_dim, block_size * self.head_dim) / math.sqrt(self.head_dim))
 
     def compress(self, x):
         B, T, C = x.shape
-        num_mid = T // self.block_size
-        w = self.weight[:num_mid, :T] * self.mask[:num_mid, :T]
-        mid = torch.einsum('mt, btc -> bmc', w, x)
-        return mid
+        # Reshape to (B, T//BS, BS, n_head, head_dim) then transpose to (B, n_head, T//BS, BS, head_dim)
+        x_blocks = x.view(B, T // self.block_size, self.block_size, self.n_head, self.head_dim)
+        x_blocks = x_blocks.permute(0, 3, 1, 2, 4) # (B, n_head, T//BS, BS, head_dim)
         
+        # Apply per-head temporal weighting: (n_head, BS) @ (B, n_head, T//BS, BS, head_dim) -> (B, n_head, T//BS, head_dim)
+        # B: Batch, h: head, m: mid, b: block, d: dim
+        mid = torch.einsum('hb, Bhmbd -> B h m d', self.weight, x_blocks)
+        return mid
 
-    def expand(self, mid):
-        B, M, C = mid.shape
-        # Project each compressed token to block_size * C
-        expanded = self.expand_proj(mid) # (B, M, block_size * C)
-        # Reshape to (B, M * block_size, C)
-        expanded = expanded.view(B, M * self.block_size, C)
-        return expanded
-
-    def expand_final(self, mid):
-        B, M, C = mid.shape
-        # Project each compressed token to block_size * C
-        expanded = self.expand_proj_final(mid) # (B, M, block_size * C)
-        # Reshape to (B, M * block_size, C)
-        expanded = expanded.view(B, M * self.block_size, C)
+    def expand_inner(self, mid, proj_weight):
+        # mid: (B, n_head, M, head_dim)
+        # proj_weight: (n_head, head_dim, BS * head_dim)
+        # Output: (B, n_head, M, BS * head_dim)
+        # B: batch, h: head, m: mid, d: head_dim, v: block_size * head_dim
+        expanded = torch.einsum('B h m d, h d v -> B h m v', mid, proj_weight)
+        
+        B, H, M, _ = expanded.shape
+        # Reshape to (B, H, M, BS, D) then transpose to (B, M, BS, H, D) then flatten to (B, T, C)
+        expanded = expanded.view(B, H, M, self.block_size, self.head_dim)
+        expanded = expanded.permute(0, 2, 3, 1, 4).contiguous()
+        expanded = expanded.view(B, M * self.block_size, self.n_embd)
         return expanded
 
     def forward(self, x):
         B, T, C = x.shape
-        if T > self.max_T:
-            raise ValueError(f"Sequence length T ({T}) exceeds max_T ({self.max_T})")
         
-        # Handle non-divisible lengths by padding
+        # Handle non-divisible lengths by padding (though usually T is a power of 2)
         padding = 0
         if T % self.block_size != 0:
             padding = self.block_size - (T % self.block_size)
             x = F.pad(x, (0, 0, 0, padding))
             
-        mid = self.compress(x)
-        restored = self.expand(mid)
+        mid_heads = self.compress(x) # (B, n_head, M, head_dim)
+        
+        # For external consumption in Attention/MLP, we need (B, M, C)
+        # (B, n_head, M, head_dim) -> (B, M, n_head, head_dim) -> (B, M, C)
+        mid = mid_heads.permute(0, 2, 1, 3).contiguous().view(B, -1, self.n_embd)
+        
+        restored = self.expand_inner(mid_heads, self.expand_proj)
         
         # Crop back if we padded
         if padding > 0:
             restored = restored[:, :T, :]
             
         return mid, restored
+
+    def expand_final(self, mid):
+        # mid is (B, M, C)
+        # Convert back to heads: (B, n_head, M, head_dim)
+        B, M, C = mid.shape
+        mid_heads = mid.view(B, M, self.n_head, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        return self.expand_inner(mid_heads, self.expand_proj) #_final)

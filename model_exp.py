@@ -107,7 +107,7 @@ class CmpBlock(nn.Module):
         # Compression factor
         self.compression_factor = getattr(config, 'compression_factor', 16)
         print(f"Compression factor: {self.compression_factor}")
-        self.compress = CompressedModule(config.n_embd, block_size=self.compression_factor, max_T=config.block_size)
+        self.compress = CompressedModule(config.n_embd, config.n_head, block_size=self.compression_factor)
         self.recon_loss = 0.0
         
         # MHC parameters
@@ -183,6 +183,7 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            #wte = nn.Embedding(config.vocab_size, config.n_embd),
             #wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([CmpBlock(config) for _ in range(config.n_layer)]),
@@ -252,38 +253,25 @@ class GPT(nn.Module):
         #x = F.normalize(x, p=2, dim=-1) # normalize output vectors to unit norm
 
         if targets is not None:
-            # Multi-token prediction: predict 16 tokens at each step
+            # Multi-token prediction
             # x shape: (B, T, C)
-            # Project to blocks: (B, T, 16, V)
+            # targets shape: (B, T, BS)
             logits = self.lm_head(x).view(b, t, self.config.compression_factor, self.config.vocab_size)
             
             # Loss is cross-entropy between predicted logits and target indices
-            # targets shape: (B, T, 16)
-            mtp_loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1), ignore_index=-1)
             
             # Add mean reconstruction loss from all blocks
             mean_recon_loss = torch.stack(recon_losses).mean()
             
-            # Add embedding dispersion loss to prevent collapse
-            # W shape: (V, C), normalized
-            # W @ W.T is the cosine similarity matrix (V, V)
-            # We want off-diagonal elements to be close to 0
-            #w = wte_normalized
-            #sim_matrix = torch.matmul(w, w.t())
-            #identity = torch.eye(self.config.vocab_size, device=device)
-            #dispersion_loss = ((sim_matrix - identity) ** 2).mean()
-            
-            # Total loss: MTP + Reconstruction + Dispersion
-            # Using 0.1 as a coefficient for dispersion as planned
-            #print("MTP loss: ", mtp_loss.item(), " Reconstruction loss: ", mean_recon_loss.item(), " Dispersion loss: ", dispersion_loss.item())
-            loss = mtp_loss + 0.1 * mean_recon_loss# + 0.1 * dispersion_loss
+            # Total loss: Prediction + Reconstruction
+            loss = loss + 0.1 * mean_recon_loss
             logits = None 
         else:
-            # inference-time: compute logits for ALL 16 predicted tokens in the block
-            # Predict tokens: (B, 1, 16, V)
+            # inference-time: compute logits for the entire block
             logits = self.lm_head(x[:, [-1], :]).view(b, 1, self.config.compression_factor, self.config.vocab_size)
             loss = None
-            mean_recon_loss = None
+            mean_recon_loss = torch.stack(recon_losses).mean()
 
         return logits, loss, mean_recon_loss
 
@@ -401,17 +389,19 @@ class GPT(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, using all 16 tokens from each model prediction.
+        the sequence max_new_tokens times, predicting compression_factor tokens at each step.
         """
         num_generated = 0
+        avg_recon_loss = 0
         while num_generated < max_new_tokens:
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             
             # forward the model to get the logits for the entire block
-            # logits shape: (B, 1, 16, V)
-            logits, _, _ = self(idx_cond)
-            logits = logits / temperature # (B, 1, 16, V)
+            # logits shape: (B, 1, BS, V)
+            logits, _, recon_loss = self(idx_cond)
+            avg_recon_loss += recon_loss.item()
+            logits = logits / temperature # (B, 1, BS, V)
             
             B, _, K, V = logits.size()
             logits = logits.view(B * K, V) # Flatten for sampling efficiency
@@ -424,15 +414,14 @@ class GPT(nn.Module):
             # apply softmax and sample
             probs = F.softmax(logits, dim=-1)
             idx_block_flat = torch.multinomial(probs, num_samples=1) # (B*K, 1)
-            idx_block = idx_block_flat.view(B, K) # (B, 16)
+            idx_block = idx_block_flat.view(B, K) # (B, BS)
             
             # Cap if we only need a few more tokens
-            #tokens_to_take = min(K, max_new_tokens - num_generated)
-            tokens_to_take = 1
+            tokens_to_take = 1#min(K, max_new_tokens - num_generated)
             idx_block = idx_block[:, :tokens_to_take]
             
             # append and update
             idx = torch.cat((idx, idx_block), dim=1)
             num_generated += tokens_to_take
-
-        return idx
+                
+        return idx, avg_recon_loss / max_new_tokens

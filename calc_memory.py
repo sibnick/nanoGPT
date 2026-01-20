@@ -68,13 +68,13 @@ def print_module_memory(model):
 
 # Config from train_shakespeare_byte_cmp.py
 config = GPTConfig(
-    block_size = 65536,
+    block_size = 256,
     vocab_size = 65,
     n_layer = 6,
     n_head = 8,
-    n_embd = 128,
+    n_embd = 384,
     dropout = 0.2,
-    compression_factor = 16,
+    compression_factor = 4,
     bias = False,
 )
 

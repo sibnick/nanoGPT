@@ -121,8 +121,11 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     # Determine the slice size for y
     y_slice_size = compression_factor if compression_factor else 1
+    step = compression_factor if compression_factor else 1
     
-    ix = torch.randint(len(data) - block_size - (y_slice_size - 1), (batch_size,))
+    max_idx = len(data) - block_size - (y_slice_size - 1)
+    num_steps = max_idx // step
+    ix = torch.randint(0, num_steps, (batch_size,)) * step
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     
     # y[b, t] should be the next token(s) starting at t+1
