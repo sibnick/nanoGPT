@@ -398,26 +398,31 @@ class GPT(nn.Module):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             
             # forward the model to get the logits for the entire block
-            # logits shape: (B, 1, BS, V)
+            # logits shape: (B, 1, K, V)
             logits, _, recon_loss = self(idx_cond)
             avg_recon_loss += recon_loss.item()
-            logits = logits / temperature # (B, 1, BS, V)
             
             B, _, K, V = logits.size()
-            logits = logits.view(B * K, V) # Flatten for sampling efficiency
             
-            # optionally crop the logits to only the top k options
+            # 1. Sample the first token from the block
+            first_token_logits = logits[:, 0, 0, :] / temperature # (B, V)
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, V))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-                
-            # apply softmax and sample
-            probs = F.softmax(logits, dim=-1)
-            idx_block_flat = torch.multinomial(probs, num_samples=1) # (B*K, 1)
-            idx_block = idx_block_flat.view(B, K) # (B, BS)
+                v, _ = torch.topk(first_token_logits, min(top_k, V))
+                first_token_logits[first_token_logits < v[:, [-1]]] = -float('Inf')
+            
+            probs = F.softmax(first_token_logits, dim=-1)
+            first_token_idx = torch.multinomial(probs, num_samples=1) # (B, 1)
+            
+            # 2. Use greedy selection (argmax) for subsequent tokens in MTP block
+            if K > 1:
+                # We take all subsequent tokens from the SAME prediction block
+                other_tokens_idx = logits[:, 0, 1:, :].argmax(dim=-1) # (B, K-1)
+                idx_block = torch.cat((first_token_idx, other_tokens_idx), dim=1) # (B, K)
+            else:
+                idx_block = first_token_idx
             
             # Cap if we only need a few more tokens
-            tokens_to_take = 1#min(K, max_new_tokens - num_generated)
+            tokens_to_take = min(K, max_new_tokens - num_generated)
             idx_block = idx_block[:, :tokens_to_take]
             
             # append and update
